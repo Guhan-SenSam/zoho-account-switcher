@@ -35,7 +35,7 @@ const MAX_NAME = 40;
 const isObject = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
 const ALNUM = /[\p{L}\p{N}]/u;
 
-/** 'TurfScout Ops' -> 'TO', 'personal' -> 'PE', 'x' -> 'X'. Max 2 chars, uppercase. */
+/** 'Admin console' -> 'AC', 'personal' -> 'PE', 'x' -> 'X'. Max 2 chars, uppercase. */
 export function initials(name) {
   const words = String(name ?? '')
     .split(/[\s._@-]+/u)

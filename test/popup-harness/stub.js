@@ -31,14 +31,16 @@
   });
 
   const FOUR = [
-    acct('a1', 'TurfScout Ops', 'TO', '#1565c0', 20e3),
+    acct('a1', 'Work', 'WO', '#1565c0', 20e3),
     acct('a2', 'Personal', 'PE', '#2e7d32', 3 * HOUR),
     acct('a3', 'Acme Corp — Admin', 'AC', '#c62828', 26 * HOUR),
-    acct('a4', 'Client: Northwind Traders International', 'CN', '#6a1b9a', 9 * 24 * HOUR),
+    acct('a4', 'Client: Northwind', 'CN', '#6a1b9a', 9 * 24 * HOUR),
   ];
 
   const MANY = [
     ...FOUR,
+    // Longest allowed name (40), active: checks truncation next to the Active pill.
+    acct('a9', 'Northwind Traders International, Billing', 'NT', '#1565c0', 6 * 24 * HOUR),
     acct('a5', 'Support desk', 'SD', '#bf360c', 5 * 60e3),
     acct('a6', 'Vault (shared)', 'VS', '#00695c', 40 * 24 * HOUR),
     acct('a7', 'Billing', 'BI', '#ad1457', 2 * HOUR),
@@ -70,7 +72,7 @@
       state: base({ incognitoAllowed: true, pending: privatePending({ windowOpen: false, captured: false }) }),
     },
     'deep-clean-on': { state: base({ settings: { deepClean: true } }) },
-    many: { state: base({ accounts: MANY, activeId: 'a5' }) },
+    many: { state: base({ accounts: MANY, activeId: 'a9' }) },
     pending: { state: base({ activeId: null, pending: { previousId: 'a1', startedAt: now - 30e3 } }) },
     'pending-first': { state: base({ accounts: [], activeId: null, pending: { previousId: null, startedAt: now } }) },
     'no-active': { state: base({ activeId: null }) },

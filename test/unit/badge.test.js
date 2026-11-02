@@ -18,14 +18,14 @@ function fakeAction() {
   };
 }
 
-const acct = { id: 'a1', name: 'TurfScout Ops', color: '#2563eb', initials: 'TO' };
+const acct = { id: 'a1', name: 'Work', color: '#2563eb', initials: 'WO' };
 
 test('active account: initials on the account colour, title names the account', async () => {
   const action = fakeAction();
   await createBadge(action).show({ active: acct, pending: false });
-  assert.deepEqual(action.last('setBadgeText'), { text: 'TO' });
+  assert.deepEqual(action.last('setBadgeText'), { text: 'WO' });
   assert.deepEqual(action.last('setBadgeBackgroundColor'), { color: '#2563eb' });
-  assert.deepEqual(action.last('setTitle'), { title: 'Zoho: TurfScout Ops' });
+  assert.deepEqual(action.last('setTitle'), { title: 'Zoho: Work' });
 });
 
 test('pending add: "+" on grey, even if an account summary is passed', async () => {
@@ -54,7 +54,7 @@ test('works when setBadgeTextColor is unavailable (older Chrome)', async () => {
   const action = fakeAction();
   delete action.setBadgeTextColor;
   await createBadge(action).show({ active: acct, pending: false });
-  assert.deepEqual(action.last('setBadgeText'), { text: 'TO' });
+  assert.deepEqual(action.last('setBadgeText'), { text: 'WO' });
 });
 
 test('show() with no arguments behaves like "no account"', async () => {
@@ -72,5 +72,5 @@ test('defaults to globalThis.chrome.action lazily (not at import time)', async (
   } finally {
     if (saved === undefined) delete globalThis.chrome; else globalThis.chrome = saved;
   }
-  assert.deepEqual(action.last('setBadgeText'), { text: 'TO' });
+  assert.deepEqual(action.last('setBadgeText'), { text: 'WO' });
 });

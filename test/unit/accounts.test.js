@@ -97,7 +97,7 @@ describe('COLORS', () => {
 
 describe('initials', () => {
   const cases = [
-    ['TurfScout Ops', 'TO'],
+    ['Admin console', 'AC'],
     ['personal', 'PE'],
     ['x', 'X'],
     ['  spaced   out  ', 'SO'],
@@ -216,11 +216,11 @@ describe('createAccountStore', () => {
     test('list returns summaries in order without cookie arrays', async () => {
       const c = clock(100);
       const store = createAccountStore(createFakeStorage(), { now: c.now });
-      const a = await store.create({ name: 'TurfScout Ops', cookies: [cookie('A'), cookie('B')] });
+      const a = await store.create({ name: 'Work', cookies: [cookie('A'), cookie('B')] });
       c.advance(10);
       const b = await store.create({ name: 'personal', cookies: [] });
       assert.deepEqual(await store.list(), [
-        { id: a.id, name: 'TurfScout Ops', color: COLORS[0], initials: 'TO', createdAt: 100, savedAt: 100, cookieCount: 2 },
+        { id: a.id, name: 'Work', color: COLORS[0], initials: 'WO', createdAt: 100, savedAt: 100, cookieCount: 2 },
         { id: b.id, name: 'personal', color: COLORS[1], initials: 'PE', createdAt: 110, savedAt: 110, cookieCount: 0 },
       ]);
     });

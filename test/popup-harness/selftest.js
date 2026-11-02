@@ -402,7 +402,7 @@
       const panel = tid('pending-panel');
       check(panel?.dataset.mode === 'signout', `data-mode=signout, got ${panel?.dataset.mode}`);
       check(text(panel.querySelector('.panel-text')) === SIGNOUT_INTRO, 'sign-out intro');
-      check(text(panel.querySelector('.panel-note')) === 'Cancel signs you back in as TurfScout Ops.', 'cancel note');
+      check(text(panel.querySelector('.panel-note')) === 'Cancel signs you back in as Work.', 'cancel note');
       check(addLabel() === 'Reopen sign-in page', `add-account label, got "${addLabel()}"`);
       check(!tid('private-window-closed'), 'no private-window notice');
       check(document.activeElement === tid('new-account-name'), 'name input focused');

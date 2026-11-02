@@ -124,7 +124,7 @@ pending:  null | { previousId: string|null, startedAt: number }   "add account" 
 ```
 ```js
 export const COLORS                 // 8 distinct hex colors, readable with white text
-export function initials(name)      // 'TurfScout Ops' -> 'TO', 'personal' -> 'PE', 'x' -> 'X'; max 2 chars, uppercase
+export function initials(name)      // 'Admin console' -> 'AC', 'personal' -> 'PE', 'x' -> 'X'; max 2 chars, uppercase
 export function createAccountStore(storage = globalThis.chrome?.storage?.local) → {
   getState()                 // { accounts, order, activeId, settings, pending } with defaults filled
   list()                     // AccountSummary[] in order: { id, name, color, initials, createdAt, savedAt, cookieCount }
