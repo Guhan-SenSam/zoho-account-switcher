@@ -142,7 +142,7 @@ describe('createAccountStore', () => {
     test('fills defaults on empty storage', async () => {
       const store = createAccountStore(createFakeStorage());
       assert.deepEqual(await store.getState(), {
-        accounts: {}, order: [], activeId: null, settings: { deepClean: false }, pending: null,
+        accounts: {}, order: [], activeId: null, settings: { deepClean: false }, pending: null, switching: null,
       });
     });
 
@@ -395,7 +395,51 @@ describe('createAccountStore', () => {
       await assert.rejects(store.setPending('yes'), TypeError);
       await assert.rejects(store.setPending({ previousId: 1, startedAt: 1 }), TypeError);
       await assert.rejects(store.setPending({ previousId: null }), TypeError);
+      await assert.rejects(store.setPending({ previousId: null, startedAt: 1, previousCookies: 'x' }), TypeError);
+      await assert.rejects(store.setPending({ previousId: null, startedAt: 1, previousCookies: null }), TypeError);
       assert.equal(await store.getPending(), null);
+    });
+
+    test('optional previousCookies (an unsaved session stashed by beginAdd) round-trips', async () => {
+      const storage = createFakeStorage();
+      const store = createAccountStore(storage);
+      const p = { previousId: null, startedAt: 2, previousCookies: [cookie('A'), cookie('B')] };
+      assert.deepEqual(await store.setPending(p), p);
+      assert.deepEqual(await store.getPending(), p);
+      assert.deepEqual(storage.dump().pending, p);
+      assert.deepEqual(await store.setPending({ previousId: 'x', startedAt: 3, junk: 1 }), { previousId: 'x', startedAt: 3 });
+    });
+  });
+
+  describe('switching (switch-in-progress marker)', () => {
+    test('get/set/clear; included in getState', async () => {
+      const storage = createFakeStorage();
+      const store = createAccountStore(storage);
+      assert.equal(await store.getSwitching(), null);
+      const m = { from: 'a', to: 'b', startedAt: 7 };
+      assert.deepEqual(await store.setSwitching(m), m);
+      assert.deepEqual(await store.getSwitching(), m);
+      assert.deepEqual((await store.getState()).switching, m);
+      assert.deepEqual(storage.dump().switching, m);
+      await store.setSwitching({ from: null, to: 'b', startedAt: 8 });
+      assert.deepEqual(await store.getSwitching(), { from: null, to: 'b', startedAt: 8 });
+      await store.setSwitching(null);
+      assert.equal(await store.getSwitching(), null);
+      assert.equal((await store.getState()).switching, null);
+    });
+
+    test('drops unknown fields and rejects malformed markers', async () => {
+      const store = createAccountStore(createFakeStorage());
+      assert.deepEqual(await store.setSwitching({ from: 'a', to: 'b', startedAt: 1, extra: 1 }), { from: 'a', to: 'b', startedAt: 1 });
+      for (const bad of ['yes', {}, { from: 'a', to: null, startedAt: 1 }, { from: 1, to: 'b', startedAt: 1 }, { from: 'a', to: 'b' }]) {
+        await assert.rejects(store.setSwitching(bad), TypeError, JSON.stringify(bad));
+      }
+      assert.deepEqual(await store.getSwitching(), { from: 'a', to: 'b', startedAt: 1 });
+    });
+
+    test('a malformed stored value reads as null', async () => {
+      const store = createAccountStore(createFakeStorage({ switching: 'garbage' }));
+      assert.equal(await store.getSwitching(), null);
     });
   });
 

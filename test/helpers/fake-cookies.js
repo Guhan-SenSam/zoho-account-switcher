@@ -12,8 +12,11 @@
 //   domain cookies, else the URL host. session iff no expirationDate. Same
 //   name+domain+path+partition overwrites. Cookies Chrome refuses (bad prefix,
 //   SameSite=None without Secure, Secure over http, partitioned without Secure,
-//   domain not matching the URL, public-suffix domain, relative path) make the
-//   promise REJECT with Chrome's message, like real Chrome. An already-expired
+//   domain not matching the URL, public-suffix domain, relative path, or a
+//   non-secure cookie from an http URL that would shadow an existing Secure
+//   cookie — "Strict Secure Cookies": same name and partition, domains
+//   domain-match either way, new path path-matches the Secure cookie's path)
+//   make the promise REJECT with Chrome's message, like real Chrome. An already-expired
 //   expirationDate deletes the existing cookie and resolves `undefined`, also
 //   like Chrome. Pass `{ invalidSet: 'null' }` to resolve null instead of
 //   rejecting.
@@ -93,6 +96,22 @@ function defaultPath(url) {
   if (!p.startsWith('/')) return '/';
   const last = p.lastIndexOf('/');
   return last <= 0 ? '/' : p.slice(0, last);
+}
+
+const domainOrSubdomain = (a, b) => a === b || a.endsWith(`.${b}`);
+
+// rfc6265bis "Strict Secure Cookies": an insecure source may not set a cookie
+// that would overlay an existing Secure cookie of the same name.
+function shadowsSecureCookie(jar, candidate) {
+  const d = stripDot(candidate.domain);
+  for (const c of jar.values()) {
+    if (!c.secure || c.name !== candidate.name) continue;
+    if (partitionId(c.partitionKey) !== partitionId(candidate.partitionKey)) continue;
+    const cd = stripDot(c.domain);
+    if (!domainOrSubdomain(d, cd) && !domainOrSubdomain(cd, d)) continue;
+    if (pathMatches(candidate.path, c.path)) return true;
+  }
+  return false;
 }
 
 // Chrome's MatchFilter::MatchesDomain for getAll({domain})
@@ -234,6 +253,10 @@ export function createFakeCookies({
       };
       if (!session) cookie.expirationDate = details.expirationDate;
       if (partitionKey) cookie.partitionKey = partitionKey;
+
+      if (!secure && url.protocol !== 'https:' && shadowsSecureCookie(jar, cookie)) {
+        return fail('would overlay a Secure cookie from an insecure origin');
+      }
 
       const key = keyOf(cookie);
       if (isExpired(cookie)) {

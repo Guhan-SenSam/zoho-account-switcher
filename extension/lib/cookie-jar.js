@@ -39,10 +39,15 @@ export function toSavedCookie(c) {
   return saved;
 }
 
-/** URL the cookie belongs to: `${secure?'https':'http'}://${domain sans '.'}${path||'/'}`. */
+/**
+ * URL the cookie belongs to: `https://${domain sans '.'}${path||'/'}`. Always
+ * https (Zoho is HTTPS-only): Chrome won't let an http source set a non-secure
+ * cookie that would shadow a Secure one of the same name, which made restores
+ * depend on the order of parallel set() calls.
+ */
 export function cookieUrl(cookie) {
   const host = cookie.domain.startsWith('.') ? cookie.domain.slice(1) : cookie.domain;
-  return `${cookie.secure ? 'https' : 'http'}://${host}${cookie.path || '/'}`;
+  return `https://${host}${cookie.path || '/'}`;
 }
 
 /**
@@ -132,37 +137,45 @@ export function createCookieJar(api = globalThis.chrome?.cookies, { now = () => 
     return removed.size;
   }
 
+  /** Sets one cookie; resolves to null on success or an error message. */
+  async function setOne(c) {
+    try {
+      const result = await cookiesApi().set(toSetDetails(c));
+      return result == null ? 'Cookie was not set' : null;
+    } catch (err) {
+      return errorMessage(err);
+    }
+  }
+
   /**
-   * Set saved cookies back (in parallel). Expired persistent cookies are skipped.
-   * A set() that rejects, throws, or resolves null/undefined is reported in `failed`.
+   * Set saved cookies back: all in parallel, then each failure retried once,
+   * one at a time. Expired persistent cookies are skipped; with `onlyMissing`
+   * so are cookies already live (same name|domain|path|partitionKey), so newer
+   * live values are never overwritten. A set() that rejects, throws, or
+   * resolves null/undefined twice is reported in `failed`.
    */
-  async function restore(saved) {
-    const a = cookiesApi();
+  async function restore(saved, { onlyMissing = false } = {}) {
+    cookiesApi(); // fail fast without chrome.cookies, even for an empty list
     const nowSeconds = now() / 1000;
+    const live = onlyMissing ? new Set((await snapshot()).map(cookieKey)) : null;
     const toSet = [];
     let skipped = 0;
     for (const c of saved ?? []) {
-      if (!c.session && typeof c.expirationDate === 'number' && c.expirationDate <= nowSeconds) {
+      const expired = !c.session && typeof c.expirationDate === 'number' && c.expirationDate <= nowSeconds;
+      if (expired || live?.has(cookieKey(c))) {
         skipped += 1;
       } else {
         toSet.push(c);
       }
     }
 
-    const results = await Promise.allSettled(toSet.map((c) => attempt(() => a.set(toSetDetails(c)))));
-    let restored = 0;
+    const firstErrors = await Promise.all(toSet.map(setOne));
     const failed = [];
-    results.forEach((r, i) => {
-      const { name, domain } = toSet[i];
-      if (r.status === 'rejected') {
-        failed.push({ name, domain, error: errorMessage(r.reason) });
-      } else if (r.value == null) {
-        failed.push({ name, domain, error: 'Cookie was not set' });
-      } else {
-        restored += 1;
-      }
-    });
-    return { restored, skipped, failed };
+    for (const c of toSet.filter((_, i) => firstErrors[i] !== null)) {
+      const error = await setOne(c);
+      if (error !== null) failed.push({ name: c.name, domain: c.domain, error });
+    }
+    return { restored: toSet.length - failed.length, skipped, failed };
   }
 
   return { snapshot, clear, restore };

@@ -4,8 +4,12 @@
 import { isZohoCookieDomain } from './zoho-domains.js';
 
 export const SYNC_DEBOUNCE_MS = 1500;
+export const SYNC_MAX_WAIT_MS = 10_000;
 
 const name = (msg) => (typeof msg.name === 'string' ? msg.name : '');
+
+// The popup only needs to know an add is in progress; never ship stashed cookies.
+const publicPending = (p) => (p ? { previousId: p.previousId ?? null, startedAt: p.startedAt } : null);
 
 function settingsPatch(patch) {
   if (!patch || typeof patch !== 'object') throw new Error('Invalid settings');
@@ -25,7 +29,7 @@ export function createRouter({ switcher, store, extensionUrl }) {
     return {
       accounts,
       activeId: s.activeId ?? null,
-      pending: s.pending ?? null,
+      pending: publicPending(s.pending),
       settings: s.settings,
       busy: switcher.isBusy(),
     };
@@ -78,30 +82,36 @@ export function createRouter({ switcher, store, extensionUrl }) {
 }
 
 /**
- * Debounces chrome.cookies.onChanged into switcher.syncActive(). If a
- * user-initiated op is still running when the timer fires, the sync is
- * postponed (not dropped) so cookies rotated during the op are still captured.
+ * Debounces chrome.cookies.onChanged into switcher.syncActive(): 1500 ms after
+ * the last change, but no later than 10 s after the first unsynced one (so
+ * constant churn can't starve it). While any switcher op holds the lock the
+ * sync is postponed rather than handed to syncActive (which would drop it), so
+ * cookies rotated during the op are still captured.
  */
 export function createCookieSyncScheduler({
   switcher,
   delay = SYNC_DEBOUNCE_MS,
+  maxWait = SYNC_MAX_WAIT_MS,
+  now = () => Date.now(),
   setTimer = (fn, ms) => setTimeout(fn, ms),
   clearTimer = (id) => clearTimeout(id),
   log = (...args) => console.warn(...args),
 }) {
   let timer = null;
+  let firstChangeAt = null; // first change not yet captured by a sync
 
-  function schedule() {
+  function arm(ms) {
     if (timer !== null) clearTimer(timer);
-    timer = setTimer(fire, delay);
+    timer = setTimer(fire, ms);
   }
 
   async function fire() {
     timer = null;
-    if (switcher.isBusy()) {
-      schedule();
+    if (switcher.isLocked()) {
+      arm(delay);
       return;
     }
+    firstChangeAt = null;
     try {
       await switcher.syncActive();
     } catch (err) {
@@ -112,7 +122,9 @@ export function createCookieSyncScheduler({
   return {
     onCookieChanged(changeInfo) {
       if (!isZohoCookieDomain(changeInfo?.cookie?.domain)) return;
-      schedule();
+      const t = now();
+      if (firstChangeAt === null) firstChangeAt = t;
+      arm(Math.max(0, Math.min(delay, firstChangeAt + maxWait - t)));
     },
   };
 }

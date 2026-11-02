@@ -7,7 +7,22 @@ import { createSwitcher } from '../../extension/lib/switcher.js';
 // The jar models the browser's live Zoho cookie state.
 // ---------------------------------------------------------------------------
 
+// `ck` cookies are httpOnly domain cookies on .zoho.com, i.e. sign-in "anchor" cookies.
 const ck = (value, name = 'sid') => [{ name, value, domain: '.zoho.com', hostOnly: false, path: '/', secure: true, httpOnly: true, sameSite: 'lax', session: true }];
+const hostCk = (value, name = 'zm') => ({ name, value, domain: 'mail.zoho.com', hostOnly: true, path: '/', secure: true, httpOnly: false, sameSite: 'lax', session: true });
+
+/** Runs fn with console.info captured; returns the logged lines. */
+async function captureInfo(fn) {
+  const info = console.info;
+  const lines = [];
+  console.info = (...args) => lines.push(args.join(' '));
+  try {
+    await fn();
+  } finally {
+    console.info = info;
+  }
+  return lines;
+}
 
 function deferred() {
   let resolve;
@@ -24,6 +39,7 @@ function makeStore(log, init = {}) {
     activeId: null,
     settings: { deepClean: false },
     pending: null,
+    switching: null,
     ...init,
   };
   let seq = 0;
@@ -66,6 +82,8 @@ function makeStore(log, init = {}) {
     async updateSettings(patch) { Object.assign(state.settings, patch); return clone(state.settings); },
     async getPending() { return clone(state.pending); },
     async setPending(p) { rec('store.setPending', clone(p)); state.pending = clone(p); },
+    async getSwitching() { return clone(state.switching); },
+    async setSwitching(m) { rec('store.setSwitching', clone(m)); state.switching = clone(m); },
   };
 }
 
@@ -88,13 +106,16 @@ function makeJar(log, live = []) {
       jar.live = [];
       return n;
     },
-    async restore(saved) {
-      log.push(['jar.restore', structuredClone(saved)]);
+    async restore(saved, opts) {
+      log.push(opts ? ['jar.restore', structuredClone(saved), opts] : ['jar.restore', structuredClone(saved)]);
       if (jar.restoreThrows) { const e = jar.restoreThrows; jar.restoreThrows = null; throw e; }
-      jar.live = structuredClone(saved);
+      const key = (c) => `${c.name}|${c.domain}|${c.path}`;
+      const liveKeys = new Set(jar.live.map(key));
+      const toSet = opts?.onlyMissing ? saved.filter((c) => !liveKeys.has(key(c))) : saved;
+      jar.live = opts?.onlyMissing ? [...jar.live, ...structuredClone(toSet)] : structuredClone(saved);
       const failed = jar.restoreFailed;
       jar.restoreFailed = [];
-      return { restored: saved.length - failed.length, skipped: 0, failed };
+      return { restored: toSet.length - failed.length, skipped: saved.length - toSet.length, failed };
     },
   };
   return jar;
@@ -121,13 +142,14 @@ function account(id, cookies) {
 }
 
 // Two saved accounts, A active, live cookies = A's latest.
-function setup({ activeId = 'A', pending = null, deepClean = false, live } = {}) {
+function setup({ activeId = 'A', pending = null, switching = null, deepClean = false, live } = {}) {
   const log = [];
   const store = makeStore(log, {
     accounts: { A: account('A', ck('a-old')), B: account('B', ck('b')) },
     order: ['A', 'B'],
     activeId,
     pending,
+    switching,
     settings: { deepClean },
   });
   const jar = makeJar(log, live ?? ck('a-live'));
@@ -143,26 +165,31 @@ const names = (log) => log.map((e) => e[0]);
 // switchTo
 // ---------------------------------------------------------------------------
 
-test('switchTo: snapshot → save outgoing → clear → restore → set active → badge → reset tabs', async () => {
+test('switchTo: snapshot → save outgoing → mark switching → clear → restore → set active → unmark → badge → reset tabs', async () => {
   const { log, store, jar, switcher } = setup();
   const res = await switcher.switchTo('B');
   assert.deepEqual(res, { warnings: [] });
   assert.deepEqual(names(log), [
     'jar.snapshot',
     'store.updateCookies',
+    'store.setSwitching',
     'jar.clear',
     'jar.restore',
     'store.setActiveId',
+    'store.setSwitching',
     'badge.show',
     'siteData.resetTabs',
   ]);
   assert.deepEqual(log[1], ['store.updateCookies', 'A', ck('a-live')]);
-  assert.deepEqual(log[3], ['jar.restore', ck('b')]);
-  assert.deepEqual(log[4], ['store.setActiveId', 'B']);
-  assert.deepEqual(log[5], ['badge.show', 'B', false]);
+  assert.deepEqual(log[2], ['store.setSwitching', { from: 'A', to: 'B', startedAt: 1000 }]);
+  assert.deepEqual(log[4], ['jar.restore', ck('b')]);
+  assert.deepEqual(log[5], ['store.setActiveId', 'B']);
+  assert.deepEqual(log[6], ['store.setSwitching', null]);
+  assert.deepEqual(log[7], ['badge.show', 'B', false]);
   assert.deepEqual(store.state.accounts.A.cookies, ck('a-live'));
   assert.deepEqual(jar.live, ck('b'));
   assert.equal(store.state.activeId, 'B');
+  assert.equal(store.state.switching, null);
 });
 
 test('switchTo: deep clean runs between clear and restore when enabled', async () => {
@@ -171,10 +198,12 @@ test('switchTo: deep clean runs between clear and restore when enabled', async (
   assert.deepEqual(names(log), [
     'jar.snapshot',
     'store.updateCookies',
+    'store.setSwitching',
     'jar.clear',
     'siteData.deepClean',
     'jar.restore',
     'store.setActiveId',
+    'store.setSwitching',
     'badge.show',
     'siteData.resetTabs',
   ]);
@@ -192,7 +221,8 @@ test('switchTo: a failing deep clean becomes a warning, the switch still complet
 test('switchTo: from no active account skips the outgoing snapshot', async () => {
   const { log, store, switcher } = setup({ activeId: null });
   await switcher.switchTo('B');
-  assert.deepEqual(names(log), ['jar.clear', 'jar.restore', 'store.setActiveId', 'badge.show', 'siteData.resetTabs']);
+  assert.deepEqual(names(log), ['store.setSwitching', 'jar.clear', 'jar.restore', 'store.setActiveId', 'store.setSwitching', 'badge.show', 'siteData.resetTabs']);
+  assert.deepEqual(log[0], ['store.setSwitching', { from: null, to: 'B', startedAt: 1000 }]);
   assert.deepEqual(store.state.accounts.A.cookies, ck('a-old'));
 });
 
@@ -214,16 +244,24 @@ test('switchTo: same id as active is a no-op', async () => {
   assert.deepEqual(log, []);
 });
 
-test('switchTo: restore failures are reported as warnings', async () => {
+test('switchTo: restore failures are reported as a warning naming the cookies', async () => {
   const { jar, switcher } = setup();
-  jar.restoreFailed = [{ name: 'x', domain: '.zoho.com', error: 'e' }, { name: 'y', domain: '.zoho.com', error: 'e' }];
-  assert.deepEqual(await switcher.switchTo('B'), { warnings: ['2 cookies could not be restored'] });
+  jar.restoreFailed = [{ name: 'IAMX', domain: '.zoho.com', error: 'e' }, { name: 'zz', domain: 'mail.zoho.com', error: 'e' }];
+  assert.deepEqual(await switcher.switchTo('B'), { warnings: ['Could not restore 2 cookies: IAMX (.zoho.com), zz (mail.zoho.com)'] });
 });
 
 test('switchTo: a single restore failure uses the singular', async () => {
   const { jar, switcher } = setup();
   jar.restoreFailed = [{ name: 'x', domain: '.zoho.com', error: 'e' }];
-  assert.deepEqual(await switcher.switchTo('B'), { warnings: ['1 cookie could not be restored'] });
+  assert.deepEqual(await switcher.switchTo('B'), { warnings: ['Could not restore 1 cookie: x (.zoho.com)'] });
+});
+
+test('switchTo: the warning lists at most 3 cookies', async () => {
+  const { jar, switcher } = setup();
+  jar.restoreFailed = ['a', 'b', 'c', 'd', 'e'].map((name) => ({ name, domain: '.zoho.eu', error: 'e' }));
+  assert.deepEqual(await switcher.switchTo('B'), {
+    warnings: ['Could not restore 5 cookies: a (.zoho.eu), b (.zoho.eu), c (.zoho.eu), …'],
+  });
 });
 
 test('switchTo: if restore throws, the outgoing account is put back so a later sync cannot corrupt it', async () => {
@@ -231,6 +269,7 @@ test('switchTo: if restore throws, the outgoing account is put back so a later s
   jar.restoreThrows = new Error('cookies API exploded');
   await assert.rejects(switcher.switchTo('B'), { message: 'cookies API exploded' });
   assert.equal(store.state.activeId, 'A');
+  assert.equal(store.state.switching, null, 'marker cleared on the rollback path');
   assert.deepEqual(jar.live, ck('a-live'));
   assert.equal(switcher.isBusy(), false);
   // a sync after the failure writes A's own cookies into A
@@ -241,6 +280,7 @@ test('switchTo: if restore throws, the outgoing account is put back so a later s
 
 test('switchTo: if clear fails part-way, the outgoing account is restored in full', async () => {
   const { store, jar, switcher } = setup({ live: [...ck('a1', 'one'), ...ck('a2', 'two')] });
+  store.state.accounts.A.cookies = [...ck('a0', 'one'), ...ck('a0', 'two')];
   const origClear = jar.clear;
   let first = true;
   jar.clear = async () => {
@@ -261,6 +301,7 @@ test('switchTo: if the rollback also fails, the active account is cleared rather
   await assert.rejects(switcher.switchTo('B'), { message: 'still broken' });
   assert.equal(restoreCalls, 2);
   assert.equal(store.state.activeId, null);
+  assert.equal(store.state.switching, null);
   assert.equal(await switcher.syncActive(), false);
   assert.deepEqual(store.state.accounts.A.cookies, ck('a-live'));
 });
@@ -279,10 +320,8 @@ test('ops are serialized: a second switch starts only after the first finishes',
   assert.deepEqual(names(log), ['jar.snapshot']);
   gate.resolve();
   await Promise.all([p1, p2]);
-  assert.deepEqual(names(log), [
-    'jar.snapshot', 'store.updateCookies', 'jar.clear', 'jar.restore', 'store.setActiveId', 'badge.show', 'siteData.resetTabs',
-    'jar.snapshot', 'store.updateCookies', 'jar.clear', 'jar.restore', 'store.setActiveId', 'badge.show', 'siteData.resetTabs',
-  ]);
+  const one = ['jar.snapshot', 'store.updateCookies', 'store.setSwitching', 'jar.clear', 'jar.restore', 'store.setActiveId', 'store.setSwitching', 'badge.show', 'siteData.resetTabs'];
+  assert.deepEqual(names(log), [...one, ...one]);
   assert.equal(store.state.activeId, 'A');
   assert.deepEqual(store.state.accounts.A.cookies, ck('a-live'));
   assert.deepEqual(store.state.accounts.B.cookies, ck('b'));
@@ -312,6 +351,41 @@ test('isBusy is true while a user op runs or is queued, false afterwards', async
   removeGate.resolve();
   await p2;
   assert.equal(switcher.isBusy(), false);
+});
+
+test('isLocked is true while any state-changing op runs or is queued, user or background', async () => {
+  const { jar, switcher } = setup({ switching: { from: 'A', to: 'B', startedAt: 1 } });
+  assert.equal(switcher.isLocked(), false);
+  const recovering = switcher.recoverInterruptedSwitch();
+  assert.equal(switcher.isLocked(), true);
+  assert.equal(switcher.isBusy(), false, 'isBusy stays user-ops-only');
+  await recovering;
+  assert.equal(switcher.isLocked(), false);
+
+  const gate = deferred();
+  jar.snapshotGate = gate.promise;
+  const syncing = switcher.syncActive();
+  assert.equal(switcher.isLocked(), true);
+  assert.equal(switcher.isBusy(), false);
+  gate.resolve();
+  await syncing;
+
+  const starting = switcher.restoreActiveOnStartup();
+  assert.equal(switcher.isLocked(), true);
+  await starting;
+
+  const switching = switcher.switchTo('A');
+  assert.equal(switcher.isLocked(), true);
+  assert.equal(switcher.isBusy(), true);
+  await switching;
+  assert.equal(switcher.isLocked(), false);
+});
+
+test('isLocked ignores a read-only badge refresh (syncActive does not defer to it either)', async () => {
+  const { switcher } = setup();
+  const p = switcher.refreshBadge();
+  assert.equal(switcher.isLocked(), false);
+  await p;
 });
 
 test('isBusy stays false during syncActive and restoreActiveOnStartup', async () => {
@@ -448,6 +522,154 @@ test('syncActive: drops the write if an add became pending during the snapshot',
 });
 
 // ---------------------------------------------------------------------------
+// Switching marker and crash recovery
+// ---------------------------------------------------------------------------
+
+test('switchTo: the marker is persisted before cookies are cleared', async () => {
+  const { store, jar, switcher } = setup();
+  let markerAtClear;
+  const origClear = jar.clear;
+  jar.clear = async () => { markerAtClear = structuredClone(store.state.switching); return origClear(); };
+  await switcher.switchTo('B');
+  assert.deepEqual(markerAtClear, { from: 'A', to: 'B', startedAt: 1000 });
+});
+
+test('syncActive: false and no-op while a switch marker is set (interrupted switch)', async () => {
+  const { log, store, switcher } = setup({ switching: { from: 'A', to: 'B', startedAt: 1 } });
+  assert.equal(await switcher.syncActive(), false);
+  assert.deepEqual(log, []);
+  assert.deepEqual(store.state.accounts.A.cookies, ck('a-old'));
+});
+
+test('syncActive: drops the write if a switch marker appeared during the snapshot', async () => {
+  const { log, store, jar, switcher } = setup();
+  const gate = deferred();
+  jar.snapshotGate = gate.promise;
+  const p = switcher.syncActive();
+  await tick();
+  store.state.switching = { from: 'A', to: 'B', startedAt: 1 };
+  gate.resolve();
+  assert.equal(await p, false);
+  assert.equal(names(log).includes('store.updateCookies'), false);
+});
+
+test('restoreActiveOnStartup: does nothing to cookies while a switch marker is set', async () => {
+  const { log, switcher } = setup({ switching: { from: 'A', to: 'B', startedAt: 1 } });
+  await switcher.restoreActiveOnStartup();
+  assert.deepEqual(names(log).filter((n) => n.startsWith('jar.')), []);
+});
+
+test('recoverInterruptedSwitch: no marker → no-op', async () => {
+  const { log, switcher } = setup();
+  assert.equal(await switcher.recoverInterruptedSwitch(), null);
+  assert.deepEqual(log, []);
+});
+
+test('recoverInterruptedSwitch: finishes the switch to the target', async () => {
+  // crashed after clear(): live jar holds a fragment of B, A is still "active"
+  const { log, store, jar, switcher } = setup({ switching: { from: 'A', to: 'B', startedAt: 1 }, live: ck('b-fragment') });
+  const res = await switcher.recoverInterruptedSwitch();
+  assert.deepEqual(res, { activeId: 'B', warnings: [] });
+  assert.deepEqual(names(log), ['jar.clear', 'jar.restore', 'store.setActiveId', 'store.setSwitching', 'badge.show', 'siteData.resetTabs']);
+  assert.deepEqual(log[1], ['jar.restore', ck('b')]);
+  assert.deepEqual(jar.live, ck('b'));
+  assert.equal(store.state.activeId, 'B');
+  assert.equal(store.state.switching, null);
+  assert.deepEqual(store.state.accounts.A.cookies, ck('a-old'), 'nothing written into the outgoing account');
+});
+
+test('recoverInterruptedSwitch: deep cleans when enabled', async () => {
+  const { log, switcher } = setup({ switching: { from: 'A', to: 'B', startedAt: 1 }, deepClean: true });
+  await switcher.recoverInterruptedSwitch();
+  const n = names(log);
+  assert.ok(n.indexOf('siteData.deepClean') > n.indexOf('jar.clear'));
+  assert.ok(n.indexOf('siteData.deepClean') < n.indexOf('jar.restore'));
+});
+
+test('recoverInterruptedSwitch: target gone → back to the outgoing account', async () => {
+  const { store, jar, switcher } = setup({ switching: { from: 'A', to: 'gone', startedAt: 1 }, live: [] });
+  assert.deepEqual(await switcher.recoverInterruptedSwitch(), { activeId: 'A', warnings: [] });
+  assert.deepEqual(jar.live, ck('a-old'));
+  assert.equal(store.state.activeId, 'A');
+  assert.equal(store.state.switching, null);
+});
+
+test('recoverInterruptedSwitch: both gone → signed out, nothing active', async () => {
+  const { store, jar, switcher } = setup({ switching: { from: null, to: 'gone', startedAt: 1 }, live: ck('fragment') });
+  assert.deepEqual(await switcher.recoverInterruptedSwitch(), { activeId: null, warnings: [] });
+  assert.deepEqual(jar.live, []);
+  assert.equal(store.state.activeId, null);
+  assert.equal(store.state.switching, null);
+});
+
+test('recoverInterruptedSwitch: restore failures become warnings', async () => {
+  const { jar, switcher } = setup({ switching: { from: 'A', to: 'B', startedAt: 1 } });
+  jar.restoreFailed = [{ name: 'x', domain: '.zoho.com', error: 'e' }];
+  const { warnings } = await switcher.recoverInterruptedSwitch();
+  assert.equal(warnings.length, 1);
+});
+
+test('recoverInterruptedSwitch runs under the mutex: an op queued after it sees the recovered state', async () => {
+  const { store, switcher } = setup({ switching: { from: 'A', to: 'B', startedAt: 1 } });
+  const rec = switcher.recoverInterruptedSwitch();
+  const sync = switcher.syncActive();
+  await rec;
+  assert.equal(await sync, false, 'sync queued during recovery is skipped, not run on the half-switched jar');
+  assert.equal(store.state.activeId, 'B');
+  assert.deepEqual(store.state.accounts.A.cookies, ck('a-old'));
+});
+
+// ---------------------------------------------------------------------------
+// Sign-out guard: a signed-out-looking live jar never replaces a saved session
+// ---------------------------------------------------------------------------
+
+test('syncActive: an external wipe (empty live jar) keeps the saved copy', async () => {
+  const { log, store, jar, switcher } = setup();
+  jar.live = [];
+  const info = await captureInfo(async () => assert.equal(await switcher.syncActive(), false));
+  assert.equal(names(log).includes('store.updateCookies'), false);
+  assert.deepEqual(store.state.accounts.A.cookies, ck('a-old'));
+  assert.equal(info.length, 1);
+  assert.match(info[0], /Account A/);
+});
+
+test('syncActive: a jar that lost every sign-in cookie (partial restore) does not shrink the saved copy', async () => {
+  const { store, jar, switcher } = setup();
+  const saved = [...ck('a-old'), hostCk('a-zm')];
+  store.state.accounts.A.cookies = structuredClone(saved);
+  jar.live = [hostCk('a-zm2')];
+  await captureInfo(async () => assert.equal(await switcher.syncActive(), false));
+  assert.deepEqual(store.state.accounts.A.cookies, saved);
+});
+
+test('syncActive: a normal rotation (anchor value changed, other cookies come and go) is saved', async () => {
+  const { store, jar, switcher } = setup();
+  store.state.accounts.A.cookies = [...ck('a-old'), hostCk('a-zm')];
+  jar.live = [...ck('a-rotated'), hostCk('new', 'other')];
+  assert.equal(await switcher.syncActive(), true);
+  assert.deepEqual(store.state.accounts.A.cookies, jar.live);
+});
+
+test('switchTo: the outgoing snapshot keeps a saved session the live jar lost', async () => {
+  const { store, jar, switcher } = setup();
+  jar.live = [hostCk('stray')]; // e.g. Zoho's auth cookies expired client-side
+  await captureInfo(() => switcher.switchTo('B'));
+  assert.deepEqual(store.state.accounts.A.cookies, ck('a-old'));
+  assert.equal(store.state.activeId, 'B');
+  assert.deepEqual(jar.live, ck('b'));
+  await switcher.switchTo('A');
+  assert.deepEqual(jar.live, ck('a-old'), 'switching back brings the intact session back');
+});
+
+test('beginAdd: the outgoing snapshot is guarded too', async () => {
+  const { store, jar, switcher } = setup();
+  jar.live = [];
+  await captureInfo(() => switcher.beginAdd());
+  assert.deepEqual(store.state.accounts.A.cookies, ck('a-old'));
+  assert.deepEqual(store.state.pending, { previousId: 'A', startedAt: 1000 });
+});
+
+// ---------------------------------------------------------------------------
 // beginAdd / finishAdd / cancelAdd
 // ---------------------------------------------------------------------------
 
@@ -480,11 +702,20 @@ test('beginAdd: deep clean after clearing cookies when enabled', async () => {
   assert.ok(n.indexOf('siteData.deepClean') < n.indexOf('siteData.resetTabs'));
 });
 
-test('beginAdd: with no active account records previousId null and skips the snapshot', async () => {
-  const { log, store, switcher } = setup({ activeId: null });
+test('beginAdd: with no active account and nothing live records previousId null only', async () => {
+  const { log, store, switcher } = setup({ activeId: null, live: [] });
   await switcher.beginAdd();
-  assert.equal(names(log).includes('jar.snapshot'), false);
+  assert.equal(names(log).includes('store.updateCookies'), false);
   assert.deepEqual(store.state.pending, { previousId: null, startedAt: 1000 });
+});
+
+test('beginAdd: an unsaved signed-in session (no active account) is stashed in pending, not saved', async () => {
+  const { log, store, jar, switcher } = setup({ activeId: null, live: ck('unsaved') });
+  await switcher.beginAdd();
+  assert.deepEqual(store.state.pending, { previousId: null, startedAt: 1000, previousCookies: ck('unsaved') });
+  assert.equal(names(log).includes('store.updateCookies'), false);
+  assert.ok(names(log).indexOf('jar.snapshot') < names(log).indexOf('jar.clear'));
+  assert.deepEqual(jar.live, []);
 });
 
 test('beginAdd: when already pending only reopens the sign-in tab', async () => {
@@ -495,15 +726,15 @@ test('beginAdd: when already pending only reopens the sign-in tab', async () => 
   assert.deepEqual(store.state.pending, pending);
 });
 
-test('finishAdd: snapshot → create → set active → clear pending → badge', async () => {
+test('finishAdd: snapshot → create → set active → clear pending → badge → reset tabs', async () => {
   const { log, store, jar, switcher } = setup({ activeId: null, pending: { previousId: 'A', startedAt: 1 }, live: ck('c-live') });
   const acc = await switcher.finishAdd('  Carol  ');
-  assert.deepEqual(names(log), ['jar.snapshot', 'store.create', 'store.setActiveId', 'store.setPending', 'badge.show']);
+  assert.deepEqual(names(log), ['jar.snapshot', 'store.create', 'store.setActiveId', 'store.setPending', 'badge.show', 'siteData.resetTabs']);
   assert.equal(acc.name, 'Carol');
   assert.deepEqual(acc.cookies, ck('c-live'));
   assert.equal(store.state.activeId, acc.id);
   assert.equal(store.state.pending, null);
-  assert.deepEqual(log.at(-1), ['badge.show', acc.id, false]);
+  assert.deepEqual(log.at(-2), ['badge.show', acc.id, false]);
   assert.deepEqual(jar.live, ck('c-live'), 'live cookies untouched');
 });
 
@@ -561,10 +792,28 @@ test('cancelAdd: previousId null → signs out, nothing active', async () => {
   assert.deepEqual(jar.live, []);
 });
 
+test('cancelAdd: previousId null → puts the stashed unsaved session back, nothing active', async () => {
+  const pending = { previousId: null, startedAt: 1, previousCookies: ck('unsaved') };
+  const { log, store, jar, switcher } = setup({ activeId: null, pending, live: ck('half') });
+  assert.deepEqual(await switcher.cancelAdd(), { warnings: [] });
+  assert.deepEqual(names(log), ['jar.clear', 'jar.restore', 'store.setActiveId', 'store.setPending', 'badge.show', 'siteData.resetTabs']);
+  assert.deepEqual(log[1], ['jar.restore', ck('unsaved')]);
+  assert.deepEqual(jar.live, ck('unsaved'));
+  assert.equal(store.state.activeId, null);
+  assert.equal(store.state.pending, null);
+});
+
+test('cancelAdd: failures restoring the stashed session become warnings', async () => {
+  const pending = { previousId: null, startedAt: 1, previousCookies: ck('unsaved') };
+  const { jar, switcher } = setup({ activeId: null, pending });
+  jar.restoreFailed = [{ name: 'x', domain: '.zoho.com', error: 'e' }];
+  assert.equal((await switcher.cancelAdd()).warnings.length, 1);
+});
+
 test('cancelAdd: restore failures become warnings', async () => {
   const { jar, switcher } = setup({ activeId: null, pending: { previousId: 'A', startedAt: 1 } });
   jar.restoreFailed = [{ name: 'x', domain: '.zoho.com', error: 'e' }];
-  assert.deepEqual(await switcher.cancelAdd(), { warnings: ['1 cookie could not be restored'] });
+  assert.deepEqual(await switcher.cancelAdd(), { warnings: ['Could not restore 1 cookie: x (.zoho.com)'] });
 });
 
 test('cancelAdd: requires a pending add', async () => {
@@ -625,11 +874,26 @@ test('remove: only deletes the saved snapshot, never touches live cookies', asyn
   assert.equal(store.state.accounts.A, undefined);
 });
 
-test('restoreActiveOnStartup: re-applies the active account without clearing', async () => {
+test('restoreActiveOnStartup: re-applies only missing cookies, without clearing; nothing missing → no reload', async () => {
   const { log, switcher } = setup();
   await switcher.restoreActiveOnStartup();
   assert.deepEqual(names(log), ['jar.restore', 'badge.show']);
-  assert.deepEqual(log[0], ['jar.restore', ck('a-old')]);
+  assert.deepEqual(log[0], ['jar.restore', ck('a-old'), { onlyMissing: true }]);
+});
+
+test('restoreActiveOnStartup: cookies the restart dropped are put back and Zoho tabs reloaded', async () => {
+  const { log, jar, switcher } = setup({ live: [] });
+  const res = await switcher.restoreActiveOnStartup();
+  assert.equal(res.restored, 1);
+  assert.deepEqual(names(log), ['jar.restore', 'badge.show', 'siteData.resetTabs']);
+  assert.deepEqual(jar.live, ck('a-old'));
+});
+
+test('restoreActiveOnStartup: never overwrites a newer live cookie with the stale saved one', async () => {
+  const { store, jar, switcher } = setup({ live: ck('a-newer') });
+  store.state.accounts.A.cookies = [...ck('a-old'), hostCk('a-zm')];
+  await switcher.restoreActiveOnStartup();
+  assert.deepEqual(jar.live, [...ck('a-newer'), hostCk('a-zm')]);
 });
 
 test('restoreActiveOnStartup: does nothing to cookies while pending or with no active account', async () => {

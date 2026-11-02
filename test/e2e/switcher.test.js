@@ -67,7 +67,9 @@ test('1. add account Alice via beginAdd -> sign in -> finishAdd', T, async (t) =
   assert.equal(by['__Host-zmcsr'].hostOnly, true);
   assert.equal(by.iamcsr.hostOnly, true);
   assert.equal(by.JSESSIONID.path, '/accounts');
-  assert.equal(by._iambdt.value, e.server.sessionFor('alice').bdt, 'saved the post-rotation _iambdt');
+  // finishAdd reloads Zoho tabs, which rotates _iambdt again; the debounced sync catches up.
+  await pollUntil(async () => cookieValue(await savedCookies(b, account.id), '_iambdt') === e.server.sessionFor('alice').bdt,
+    { message: 'saved the post-rotation _iambdt' });
 });
 
 test('2. add Bob; an already-open mail tab ends up showing bob', T, async (t) => {

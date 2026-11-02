@@ -18,6 +18,12 @@ const cookieSync = createCookieSyncScheduler({ switcher });
 
 const logError = (what) => (err) => console.error(`Zoho Account Switcher: ${what} failed`, err);
 
+// First thing on the switcher's mutex, so no event handler runs before it: a
+// switch interrupted by a crash left the jar between accounts; finish it.
+switcher.recoverInterruptedSwitch().then((r) => {
+  if (r?.warnings?.length) console.warn('Zoho Account Switcher: recovered an interrupted switch', r.warnings);
+}, logError('switch recovery'));
+
 // Browser restart: session cookies are gone; put the active account's back.
 chrome.runtime.onStartup.addListener(() => {
   switcher.restoreActiveOnStartup().catch(logError('startup restore'));

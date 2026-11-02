@@ -256,3 +256,32 @@ service worker; action popup `popup/popup.html` with icons; command
   reloading to the right user, rotation captured by sync, cancel-add restores,
   sessionStorage cleared on switch, deep clean wipes localStorage, remove, popup UI flow.
 - **Manual:** user verifies on real Zoho accounts.
+
+## Revisions after code review and E2E (2026-11-02)
+
+These supersede the contracts above where they differ.
+
+- **Sign-out guard** (`lib/session-guard.js`): a snapshot never replaces a saved
+  copy when it is empty, or when the saved copy has "anchor" cookies (httpOnly
+  domain cookies on a bare data-center domain, e.g. `.zoho.com`) and the live jar
+  has none of them. Applies to `syncActive` and to the outgoing snapshot in
+  `switchTo` / `beginAdd`. Protects against "Clear browsing data", partial
+  restores and server-side expiry overwriting a good session.
+- **Switching marker:** `switching: {from, to, startedAt}` is persisted in storage
+  for the duration of a switch; sync and startup restore skip while it's set, and
+  `recoverInterruptedSwitch()` (run first at service-worker start) completes or
+  undoes an interrupted switch.
+- **Unsaved session on Add account:** with no active account, `beginAdd` stashes
+  the live cookies in `pending.previousCookies`; `cancelAdd` restores them. The
+  popup asks for confirmation before switching away from an unsaved session.
+- **Cookie jar:** `cookieUrl` always uses `https://`; `restore` retries failures
+  once sequentially and supports `{ onlyMissing: true }`.
+- **Startup:** `restoreActiveOnStartup` only fills in missing cookies, then
+  reloads Zoho tabs if it set any.
+- **Tabs:** `resetTabs` waits (max 8 s) for reloaded Zoho tabs to finish loading,
+  so a second switch can't race an in-flight token rotation. `finishAdd` also
+  reloads Zoho tabs.
+- **Sync scheduling:** debounced 1500 ms, postponed while any op runs
+  (`switcher.isLocked()`), at most 10 s after the first unsynced change.
+- **Manifest:** fixed `key` (id `cdejiijaefadneogcpfoadhdenpfgano`),
+  `"incognito": "not_allowed"`. Message router lives in `lib/router.js`.

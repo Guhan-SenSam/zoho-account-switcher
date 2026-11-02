@@ -2,13 +2,21 @@
 // site-data helpers and badge. Every operation runs through one internal
 // promise-chain mutex, so no two operations ever interleave.
 
+import { signOutReason } from './session-guard.js';
+
 const PENDING_ERROR = 'Finish or cancel adding an account first';
 const NOT_PENDING_ERROR = 'No account is being added';
 
+const MAX_LISTED_COOKIES = 3;
+
+// 'Could not restore 2 cookies: IAMX (.zoho.com), zz (mail.zoho.com)'
 function restoreWarnings(result) {
-  const n = result?.failed?.length ?? 0;
+  const failed = result?.failed ?? [];
+  const n = failed.length;
   if (!n) return [];
-  return [`${n} ${n === 1 ? 'cookie' : 'cookies'} could not be restored`];
+  const listed = failed.slice(0, MAX_LISTED_COOKIES).map((f) => `${f.name} (${f.domain})`);
+  if (n > MAX_LISTED_COOKIES) listed.push('…');
+  return [`Could not restore ${n} ${n === 1 ? 'cookie' : 'cookies'}: ${listed.join(', ')}`];
 }
 
 export function createSwitcher({ jar, store, siteData, badge, now = () => Date.now() }) {
@@ -68,17 +76,47 @@ export function createSwitcher({ jar, store, siteData, badge, now = () => Date.n
     } catch {
       try { await store.setActiveId(null); } catch { /* nothing more we can do */ }
     }
+    try { await store.setSwitching(null); } catch { /* recovery will finish the switch instead */ }
   }
 
+  // The account a sync may write into: none while an add is pending or a switch
+  // is in progress (or was, when a crash interrupted it).
+  async function syncableActiveId() {
+    const activeId = await store.getActiveId();
+    if (!activeId || (await store.getPending()) || (await store.getSwitching())) return null;
+    return activeId;
+  }
+
+  // Writes `live` into the account unless that would replace its saved session
+  // with a signed-out jar (external wipe, expired auth cookies, partial restore).
+  async function saveUnlessSignedOut(id, live) {
+    const account = await store.get(id);
+    if (!account) return false;
+    const reason = signOutReason(account.cookies ?? [], live);
+    if (reason) {
+      console.info(`Zoho Account Switcher: kept the saved session of "${account.name}" (live cookies look signed out: ${reason})`);
+      return false;
+    }
+    await store.updateCookies(id, live);
+    return true;
+  }
+
+  // Returns the live snapshot even when the guard kept the saved copy.
   async function snapshotActiveInto(activeId) {
     const cookies = await jar.snapshot();
-    await store.updateCookies(activeId, cookies);
+    await saveUnlessSignedOut(activeId, cookies);
     return cookies;
   }
 
   return {
     isBusy() {
       return userInFlight > 0;
+    },
+
+    // Any state-changing op (user or background) running or queued: what
+    // syncActive defers to. The cookie-sync scheduler waits on this.
+    isLocked() {
+      return inFlight > 0;
     },
 
     switchTo(id) {
@@ -91,6 +129,9 @@ export function createSwitcher({ jar, store, siteData, badge, now = () => Date.n
 
         const warnings = [];
         const outgoing = activeId ? await snapshotActiveInto(activeId) : null;
+        // Until the target is active the jar belongs to no account; the persisted
+        // marker stops syncs and lets a restarted worker finish the switch.
+        await store.setSwitching({ from: activeId ?? null, to: id, startedAt: now() });
         try {
           await jar.clear();
           await maybeDeepClean(warnings);
@@ -101,6 +142,7 @@ export function createSwitcher({ jar, store, siteData, badge, now = () => Date.n
           await rollback(outgoing);
           throw err;
         }
+        await store.setSwitching(null);
         await updateBadge();
         await siteData.resetTabs();
         return { warnings };
@@ -115,8 +157,15 @@ export function createSwitcher({ jar, store, siteData, badge, now = () => Date.n
         }
         const warnings = [];
         const activeId = await store.getActiveId();
-        if (activeId) await snapshotActiveInto(activeId);
-        await store.setPending({ previousId: activeId ?? null, startedAt: now() });
+        const pending = { previousId: activeId ?? null, startedAt: now() };
+        if (activeId) {
+          await snapshotActiveInto(activeId);
+        } else {
+          // An unsaved session would be lost by the clear below; keep it for cancelAdd.
+          const live = await jar.snapshot();
+          if (live.length > 0) pending.previousCookies = live;
+        }
+        await store.setPending(pending);
         await store.setActiveId(null);
         await updateBadge();
         await jar.clear();
@@ -135,6 +184,8 @@ export function createSwitcher({ jar, store, siteData, badge, now = () => Date.n
         await store.setActiveId(account.id);
         await store.setPending(null);
         await updateBadge();
+        // Zoho tabs beginAdd signed out: reload them as the new account.
+        await siteData.resetTabs();
         return account;
       });
     },
@@ -152,6 +203,9 @@ export function createSwitcher({ jar, store, siteData, badge, now = () => Date.n
           warnings.push(...restoreWarnings(result));
           await store.setActiveId(previous.id);
         } else {
+          if (pending.previousId === null && Array.isArray(pending.previousCookies)) {
+            warnings.push(...restoreWarnings(await jar.restore(pending.previousCookies)));
+          }
           await store.setActiveId(null);
         }
         await store.setPending(null);
@@ -185,26 +239,47 @@ export function createSwitcher({ jar, store, siteData, badge, now = () => Date.n
       // leave the jar in a state that a later sync can capture.
       if (inFlight > 0) return Promise.resolve(false);
       return bgOp(async () => {
-        const activeId = await store.getActiveId();
-        if (!activeId || (await store.getPending())) return false;
+        const activeId = await syncableActiveId();
+        if (!activeId) return false;
         const cookies = await jar.snapshot();
         // Defensive re-check: only write if the snapshot still belongs to activeId.
-        if ((await store.getActiveId()) !== activeId || (await store.getPending())) return false;
-        await store.updateCookies(activeId, cookies);
-        return true;
+        if ((await syncableActiveId()) !== activeId) return false;
+        return saveUnlessSignedOut(activeId, cookies);
       });
     },
 
     restoreActiveOnStartup() {
       return bgOp(async () => {
         let result = null;
-        const activeId = await store.getActiveId();
-        if (activeId && !(await store.getPending())) {
+        const activeId = await syncableActiveId();
+        if (activeId) {
           const active = await store.get(activeId);
-          if (active) result = await jar.restore(active.cookies ?? []);
+          // Only what the restart dropped (session cookies): live values are newer.
+          if (active) result = await jar.restore(active.cookies ?? [], { onlyMissing: true });
         }
         await updateBadge();
+        // Zoho tabs brought back by session restore loaded signed out.
+        if (result?.restored > 0) await siteData.resetTabs();
         return result;
+      });
+    },
+
+    // A switch interrupted by a crash (marker still set): finish it — restore
+    // the target if it still exists, else the outgoing account, else nothing.
+    recoverInterruptedSwitch() {
+      return bgOp(async () => {
+        const marker = await store.getSwitching();
+        if (!marker) return null;
+        const warnings = [];
+        await jar.clear();
+        await maybeDeepClean(warnings);
+        const account = (await store.get(marker.to)) ?? (marker.from ? await store.get(marker.from) : null);
+        if (account) warnings.push(...restoreWarnings(await jar.restore(account.cookies ?? [])));
+        await store.setActiveId(account?.id ?? null);
+        await store.setSwitching(null);
+        await updateBadge();
+        await siteData.resetTabs();
+        return { activeId: account?.id ?? null, warnings };
       });
     },
 

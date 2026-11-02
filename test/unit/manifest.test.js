@@ -36,3 +36,7 @@ test('Alt+Shift+Z opens the popup', () => {
   assert.equal(manifest.commands._execute_action.suggested_key.default, 'Alt+Shift+Z');
   assert.equal(typeof manifest.commands._execute_action.description, 'string');
 });
+
+test('incognito is not allowed, so incognito cookie stores and tabs never mix in', () => {
+  assert.equal(manifest.incognito, 'not_allowed');
+});

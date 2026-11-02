@@ -7,7 +7,12 @@
 //   order:    string[]
 //   activeId: string | null
 //   settings: { deepClean: boolean }
-//   pending:  null | { previousId: string|null, startedAt: number }
+//   pending:  null | { previousId: string|null, startedAt: number, previousCookies?: SavedCookie[] }
+//             previousCookies: the unsaved session that was live when an add
+//             began with no active account (cancelAdd puts it back)
+//   switching: null | { from: string|null, to: string, startedAt: number }
+//              set while switchTo has cookies in flux; survives a crash so the
+//              next service worker can finish the switch (recoverInterruptedSwitch)
 
 // Blue, red, green, purple, deep orange, teal, pink, blue grey.
 // All have WCAG contrast >= 5:1 against white text.
@@ -16,7 +21,7 @@ export const COLORS = Object.freeze([
 ]);
 
 const DEFAULT_SETTINGS = Object.freeze({ deepClean: false });
-const STATE_KEYS = ['accounts', 'order', 'activeId', 'settings', 'pending'];
+const STATE_KEYS = ['accounts', 'order', 'activeId', 'settings', 'pending', 'switching'];
 const NAME_ERROR = 'Name must be 1–40 characters';
 const MAX_NAME = 40;
 
@@ -48,6 +53,7 @@ function fillState(raw) {
     activeId: typeof raw.activeId === 'string' ? raw.activeId : null,
     settings: { ...DEFAULT_SETTINGS, ...(isObject(raw.settings) ? raw.settings : {}) },
     pending: isObject(raw.pending) ? raw.pending : null,
+    switching: isObject(raw.switching) ? raw.switching : null,
   };
 }
 
@@ -93,10 +99,26 @@ function validPending(p) {
   if (p === null) return null;
   if (!isObject(p)
     || !(p.previousId === null || typeof p.previousId === 'string')
-    || typeof p.startedAt !== 'number') {
-    throw new TypeError('pending must be null or { previousId: string|null, startedAt: number }');
+    || typeof p.startedAt !== 'number'
+    || (p.previousCookies !== undefined && !Array.isArray(p.previousCookies))) {
+    throw new TypeError(
+      'pending must be null or { previousId: string|null, startedAt: number, previousCookies?: array }',
+    );
   }
-  return { previousId: p.previousId, startedAt: p.startedAt };
+  const pending = { previousId: p.previousId, startedAt: p.startedAt };
+  if (p.previousCookies !== undefined) pending.previousCookies = structuredClone(p.previousCookies);
+  return pending;
+}
+
+function validSwitching(m) {
+  if (m === null) return null;
+  if (!isObject(m)
+    || !(m.from === null || typeof m.from === 'string')
+    || typeof m.to !== 'string'
+    || typeof m.startedAt !== 'number') {
+    throw new TypeError('switching must be null or { from: string|null, to: string, startedAt: number }');
+  }
+  return { from: m.from, to: m.to, startedAt: m.startedAt };
 }
 
 export function createAccountStore(
@@ -241,6 +263,18 @@ export function createAccountStore(
         const pending = validPending(pendingOrNull);
         await write({ pending });
         return pending;
+      });
+    },
+
+    getSwitching() {
+      return exclusive(async () => (await read(['switching'])).switching);
+    },
+
+    setSwitching(markerOrNull) {
+      return exclusive(async () => {
+        const switching = validSwitching(markerOrNull);
+        await write({ switching });
+        return switching;
       });
     },
   };

@@ -107,15 +107,10 @@ test('E2. protocol error paths keep state consistent', T, async (t) => {
   assert.equal((await readPage(page)).who, 'alice', e.diag());
 });
 
-// KNOWN LIMITATION (marked todo so the suite stays green; flip to a normal test once fixed):
-// switchTo() resolves as soon as tabs.reload() has been *issued*, so the popup re-enables
-// and a second switch can snapshot the outgoing account while a reload that rotates its
-// token is still in flight. The saved copy then holds the rotated-out token and that
-// account is signed out on its next use. Waiting (bounded) for the reloaded Zoho tabs to
-// reach status "complete" before releasing the switch mutex would close this window.
-test('E3. fast switch while a token-rotating Zoho load is still in flight keeps both accounts usable', {
-  ...T, todo: 'switch releases before reloaded tabs finish loading; see comment above',
-}, async (t) => {
+// Regression: switchTo() used to resolve as soon as tabs.reload() was *issued*, so a second
+// switch could snapshot the outgoing account while a reload that rotates its token was still
+// in flight. resetTabs() now waits (bounded) for reloaded Zoho tabs to finish loading.
+test('E3. fast switch while a token-rotating Zoho load is still in flight keeps both accounts usable', T, async (t) => {
   const e = await env(t);
   const b = e.browser;
   const { alice, bob } = await aliceAndBob(e);

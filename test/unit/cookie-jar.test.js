@@ -97,6 +97,19 @@ describe('fake chrome.cookies models Chrome semantics', () => {
     assert.equal(await nullFake.set(bad[0]), null);
   });
 
+  test('an insecure URL cannot set a non-secure cookie that would shadow a Secure one (Strict Secure Cookies)', async () => {
+    const fake = createFakeCookies({ now });
+    await fake.set({ url: 'https://accounts.zoho.com/', domain: '.zoho.com', name: 'zz', value: 's', path: '/', secure: true });
+    // same name, domain-matches either way, path-matches: refused from http
+    await assert.rejects(fake.set({ url: 'http://crm.zoho.com/', name: 'zz', value: 'p', path: '/' }), /Failed to parse or set cookie/);
+    await assert.rejects(fake.set({ url: 'http://zoho.com/x', domain: '.zoho.com', name: 'zz', value: 'p', path: '/x' }), /Failed to parse or set cookie/);
+    // fine from https, or with another name / a path the Secure cookie does not cover
+    assert.ok(await fake.set({ url: 'https://crm.zoho.com/', name: 'zz', value: 'p', path: '/' }));
+    assert.ok(await fake.set({ url: 'http://crm.zoho.com/', name: 'other', value: 'p', path: '/' }));
+    await fake.set({ url: 'https://mail.zoho.com/zm', name: 'deep', value: 's', path: '/zm', secure: true });
+    assert.ok(await fake.set({ url: 'http://mail.zoho.com/', name: 'deep', value: 'p', path: '/' }));
+  });
+
   test('set accepts a proper __Host- cookie', async () => {
     const fake = createFakeCookies({ now });
     const c = await fake.set({ url: 'https://accounts.zoho.com/', name: '__Host-x', value: '1', path: '/', secure: true });
@@ -195,10 +208,10 @@ describe('toSavedCookie', () => {
 });
 
 describe('cookieUrl', () => {
-  test('secure -> https, leading dot stripped, path kept', () => {
+  test('always https (Zoho is HTTPS-only), leading dot stripped, path kept', () => {
     assert.equal(cookieUrl({ domain: '.zoho.com', path: '/', secure: true }), 'https://zoho.com/');
     assert.equal(cookieUrl({ domain: 'mail.zoho.com', path: '/zm', secure: true }), 'https://mail.zoho.com/zm');
-    assert.equal(cookieUrl({ domain: 'crm.zohocloud.ca', path: '/', secure: false }), 'http://crm.zohocloud.ca/');
+    assert.equal(cookieUrl({ domain: 'crm.zohocloud.ca', path: '/', secure: false }), 'https://crm.zohocloud.ca/');
   });
 
   test('missing path defaults to /', () => {
@@ -542,6 +555,93 @@ describe('createCookieJar', () => {
       const base = { value: 'v', domain: 'zoho.com', hostOnly: true, path: '/', secure: true, httpOnly: false, sameSite: 'lax', session: true };
       await createCookieJar(api, { now }).restore(['a', 'b', 'c', 'd'].map((name) => ({ ...base, name })));
       assert.equal(maxInFlight, 4);
+    });
+
+    test('a non-secure cookie named like a Secure domain cookie restores in either order', async () => {
+      const base = { name: 'zz', value: 'v', path: '/', httpOnly: false, sameSite: 'lax', session: true };
+      const secureDomain = { ...base, domain: '.zoho.com', hostOnly: false, secure: true };
+      const plainHost = { ...base, domain: 'crm.zoho.com', hostOnly: true, secure: false };
+      for (const order of [[secureDomain, plainHost], [plainHost, secureDomain]]) {
+        const fake = createFakeCookies({ now });
+        const result = await createCookieJar(fake, { now }).restore(order);
+        assert.deepEqual(result, { restored: 2, skipped: 0, failed: [] }, JSON.stringify(order.map((c) => c.domain)));
+        assert.equal(fake.dump().length, 2);
+      }
+    });
+
+    test('set() failures from the parallel pass are retried once, one at a time', async () => {
+      const failedOnce = new Set();
+      let inFlight = 0;
+      const concurrency = [];
+      const api = {
+        set: async (d) => {
+          inFlight += 1;
+          concurrency.push({ name: d.name, inFlight });
+          await new Promise((r) => setTimeout(r, 2));
+          inFlight -= 1;
+          if (['b', 'c'].includes(d.name) && !failedOnce.has(d.name)) {
+            failedOnce.add(d.name);
+            throw new Error('transient');
+          }
+          return { ...d };
+        },
+      };
+      const base = { value: 'v', domain: 'zoho.com', hostOnly: true, path: '/', secure: true, httpOnly: false, sameSite: 'lax', session: true };
+      const r = await createCookieJar(api, { now }).restore(['a', 'b', 'c', 'd'].map((name) => ({ ...base, name })));
+      assert.deepEqual(r, { restored: 4, skipped: 0, failed: [] });
+      const retries = concurrency.slice(4);
+      assert.deepEqual(retries.map((x) => x.name), ['b', 'c']);
+      assert.deepEqual(retries.map((x) => x.inFlight), [1, 1], 'sequential');
+    });
+
+    test('only cookies still failing after the retry are reported, with the retry\'s error', async () => {
+      let n = 0;
+      const api = {
+        set: async (d) => {
+          if (d.name !== 'bad') return { ...d };
+          n += 1;
+          throw new Error(`attempt ${n}`);
+        },
+      };
+      const base = { value: 'v', domain: '.zoho.com', hostOnly: false, path: '/', secure: true, httpOnly: false, sameSite: 'lax', session: true };
+      const r = await createCookieJar(api, { now }).restore([{ ...base, name: 'bad' }, { ...base, name: 'ok' }]);
+      assert.equal(n, 2);
+      assert.deepEqual(r, { restored: 1, skipped: 0, failed: [{ name: 'bad', domain: '.zoho.com', error: 'attempt 2' }] });
+    });
+
+    describe('onlyMissing', () => {
+      const base = { domain: '.zoho.com', hostOnly: false, path: '/', secure: true, httpOnly: true, sameSite: 'lax', session: true };
+
+      test('never overwrites a live cookie with the same name|domain|path|partitionKey', async () => {
+        const fake = createFakeCookies({ now });
+        await fake.set({ url: 'https://zoho.com/', domain: '.zoho.com', name: 'IAM', value: 'newer', path: '/', secure: true, httpOnly: true });
+        const jar = createCookieJar(fake, { now });
+        const r = await jar.restore([{ ...base, name: 'IAM', value: 'stale' }, { ...base, name: 'gone', value: 'saved' }], { onlyMissing: true });
+        assert.deepEqual(r, { restored: 1, skipped: 1, failed: [] });
+        assert.deepEqual(Object.fromEntries(fake.dump().map((c) => [c.name, c.value])), { IAM: 'newer', gone: 'saved' });
+        assert.deepEqual(fake.calls.set.slice(1).map((d) => d.name), ['gone']);
+      });
+
+      test('a different path, domain or partition is a different cookie', async () => {
+        const fake = createFakeCookies({ now });
+        await fake.set({ url: 'https://zoho.com/a', domain: '.zoho.com', name: 't', value: 'live', path: '/a', secure: true });
+        await fake.set({ url: 'https://mail.zoho.com/', name: 't', value: 'live', path: '/', secure: true });
+        const r = await createCookieJar(fake, { now }).restore([
+          { ...base, name: 't', value: 'root' },
+          { ...base, name: 't', value: 'part', partitionKey: PK },
+        ], { onlyMissing: true });
+        assert.deepEqual(r, { restored: 2, skipped: 0, failed: [] });
+      });
+
+      test('expired cookies are still skipped; default (no option) overwrites', async () => {
+        const fake = createFakeCookies({ now });
+        await fake.set({ url: 'https://zoho.com/', domain: '.zoho.com', name: 'IAM', value: 'newer', path: '/', secure: true, httpOnly: true });
+        const jar = createCookieJar(fake, { now });
+        const expired = { ...base, name: 'old', session: false, expirationDate: NOW_S - 1 };
+        assert.deepEqual(await jar.restore([expired], { onlyMissing: true }), { restored: 0, skipped: 1, failed: [] });
+        await jar.restore([{ ...base, name: 'IAM', value: 'stale' }]);
+        assert.equal(fake.dump().find((c) => c.name === 'IAM').value, 'stale');
+      });
     });
 
     test('restoring nothing is a no-op', async () => {

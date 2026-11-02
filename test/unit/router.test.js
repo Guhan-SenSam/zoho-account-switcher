@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { createRouter, createCookieSyncScheduler, SYNC_DEBOUNCE_MS } from '../../extension/lib/router.js';
+import { createRouter, createCookieSyncScheduler, SYNC_DEBOUNCE_MS, SYNC_MAX_WAIT_MS } from '../../extension/lib/router.js';
 
 const EXT = 'chrome-extension://abcdefghijklmnop/';
 const popup = { id: 'abcdefghijklmnop', url: `${EXT}popup/popup.html` };
@@ -63,6 +63,13 @@ test('getState returns the full state shape', async () => {
       busy: false,
     },
   });
+});
+
+test('state.pending never carries the stashed session cookies', async () => {
+  const { router, state } = setup();
+  state.pending = { previousId: null, startedAt: 5, previousCookies: [{ name: 'IAM', value: 'secret' }] };
+  const res = await router.handle({ type: 'getState' }, popup);
+  assert.deepEqual(res.state.pending, { previousId: null, startedAt: 5 });
 });
 
 test('state.busy mirrors switcher.isBusy()', async () => {
@@ -179,32 +186,38 @@ test('if state cannot be read, errors still respond with state: null', async () 
 // ---------------------------------------------------------------------------
 
 function fakeTimers() {
-  let now = 0;
+  let clock = 0;
   let seq = 0;
   const pending = new Map();
   return {
-    set: (fn, ms) => { const id = ++seq; pending.set(id, { fn, at: now + ms }); return id; },
+    now: () => clock,
+    set: (fn, ms) => { const id = ++seq; pending.set(id, { fn, at: clock + ms }); return id; },
     clear: (id) => { pending.delete(id); },
     get size() { return pending.size; },
     async advance(ms) {
-      const until = now + ms;
+      const until = clock + ms;
       for (;;) {
         const due = [...pending].filter(([, t]) => t.at <= until).sort((a, b) => a[1].at - b[1].at)[0];
         if (!due) break;
         pending.delete(due[0]);
-        now = due[1].at;
+        clock = Math.max(clock, due[1].at);
         await due[1].fn();
       }
-      now = until;
+      clock = Math.max(clock, until); // monotonic even when advance() calls overlap
     },
   };
 }
 
-function scheduler({ busy = () => false } = {}) {
+// syncs records the (fake) time of each syncActive() call.
+function scheduler({ locked = () => false, busy = () => false, syncActive } = {}) {
   const timers = fakeTimers();
   const syncs = [];
-  const switcher = { isBusy: busy, async syncActive() { syncs.push(timers); return true; } };
-  const s = createCookieSyncScheduler({ switcher, setTimer: timers.set, clearTimer: timers.clear });
+  const switcher = {
+    isBusy: busy,
+    isLocked: locked,
+    async syncActive() { syncs.push(timers.now()); return syncActive ? syncActive() : true; },
+  };
+  const s = createCookieSyncScheduler({ switcher, setTimer: timers.set, clearTimer: timers.clear, now: timers.now });
   return { s, timers, syncs };
 }
 
@@ -236,22 +249,76 @@ test('non-Zoho cookie changes are ignored', async () => {
   assert.equal(timers.size, 0);
 });
 
-test('while a user op is busy the sync is postponed, not dropped', async () => {
-  let busy = true;
-  const { s, timers, syncs } = scheduler({ busy: () => busy });
+test('max wait is 10 s', () => {
+  assert.equal(SYNC_MAX_WAIT_MS, 10_000);
+});
+
+test('while any switcher op holds the lock the sync is postponed, not dropped', async () => {
+  let locked = true;
+  // isBusy (user ops only) is false: a background op (sync, startup restore,
+  // recovery) still holds the switcher, and syncActive would drop the call.
+  const { s, timers, syncs } = scheduler({ locked: () => locked, busy: () => false });
   s.onCookieChanged(change('.zoho.com'));
   await timers.advance(1500);
   assert.equal(syncs.length, 0);
   await timers.advance(1500);
   assert.equal(syncs.length, 0);
-  busy = false;
+  locked = false;
   await timers.advance(1500);
   assert.equal(syncs.length, 1);
 });
 
+test('a change during a running sync is postponed until it finishes, then synced', async () => {
+  let locked = false;
+  let release = null;
+  const { s, timers, syncs } = scheduler({
+    locked: () => locked,
+    // the first sync hangs (holding the lock) until released
+    syncActive: () => {
+      if (release) return true;
+      locked = true;
+      return new Promise((r) => { release = () => { locked = false; r(true); }; });
+    },
+  });
+  s.onCookieChanged(change('.zoho.com'));
+  const first = timers.advance(1500); // first sync starts and hangs
+  await new Promise((r) => setImmediate(r));
+  assert.equal(syncs.length, 1);
+  s.onCookieChanged(change('.zoho.com')); // rotation while the first sync runs
+  await timers.advance(1500); // its timer fires while the first sync still holds the lock
+  assert.equal(syncs.length, 1, 'postponed, not handed to syncActive (which would drop it)');
+  release();
+  await first;
+  await timers.advance(1500);
+  assert.equal(syncs.length, 2);
+});
+
+test('continuous cookie churn: a sync runs no later than 10 s after the first unsynced change', async () => {
+  const { s, timers, syncs } = scheduler();
+  for (let i = 0; i < 30; i += 1) {
+    s.onCookieChanged(change('.zoho.com'));
+    await timers.advance(1000);
+  }
+  assert.deepEqual(syncs, [10_000, 20_000, 30_000]);
+});
+
+test('the max wait is still postponed while locked', async () => {
+  let locked = true;
+  const { s, timers, syncs } = scheduler({ locked: () => locked });
+  for (let t = 0; t < 12_000; t += 1000) {
+    s.onCookieChanged(change('.zoho.com'));
+    await timers.advance(1000);
+  }
+  assert.deepEqual(syncs, []);
+  locked = false;
+  await timers.advance(1500);
+  assert.equal(syncs.length, 1);
+  assert.ok(syncs[0] <= 13_500, `synced at ${syncs[0]}`);
+});
+
 test('a failing sync is logged, not thrown', async () => {
   const timers = fakeTimers();
-  const switcher = { isBusy: () => false, async syncActive() { throw new Error('nope'); } };
+  const switcher = { isBusy: () => false, isLocked: () => false, async syncActive() { throw new Error('nope'); } };
   const s = createCookieSyncScheduler({ switcher, setTimer: timers.set, clearTimer: timers.clear, log: () => {} });
   s.onCookieChanged(change('.zoho.com'));
   await timers.advance(1500);
