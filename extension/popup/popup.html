@@ -1,0 +1,43 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <title>Zoho Account Switcher</title>
+  <link rel="stylesheet" href="popup.css">
+  <script type="module" src="popup.js"></script>
+</head>
+<body data-busy="true">
+  <header class="header">
+    <img class="logo" src="../icons/icon-32.png" width="20" height="20" alt="">
+    <h1 class="title">Zoho Accounts</h1>
+    <span class="busy-indicator">
+      <span class="status" id="status" aria-hidden="true"></span>
+      <span class="spinner" role="progressbar" aria-label="Working…"></span>
+    </span>
+  </header>
+
+  <div class="message" id="message-box" hidden>
+    <p class="message-text" data-testid="message" id="message" aria-live="polite"></p>
+    <button type="button" class="icon-btn message-dismiss" id="message-dismiss" aria-label="Dismiss message">
+      <svg viewBox="0 0 16 16" width="12" height="12" aria-hidden="true"><path d="M4 4l8 8M12 4l-8 8" stroke="currentColor" stroke-width="1.75" stroke-linecap="round"/></svg>
+    </button>
+  </div>
+
+  <main id="main" class="main" aria-busy="true"></main>
+
+  <footer class="footer" id="footer" hidden>
+    <button type="button" class="btn btn-block" id="add-account" data-testid="add-account">
+      <span class="btn-icon" aria-hidden="true">+</span><span class="btn-label">Add account</span>
+    </button>
+    <label class="check">
+      <input type="checkbox" id="deep-clean" data-testid="deep-clean" aria-describedby="deep-clean-hint">
+      <span class="check-text">
+        <span class="check-label">Deep clean site data on switch</span>
+        <span class="hint" id="deep-clean-hint">Also wipes Zoho storage &amp; caches. Slower.</span>
+      </span>
+    </label>
+  </footer>
+</body>
+</html>

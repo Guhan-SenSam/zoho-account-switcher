@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128">
+  <!-- 48/128px variant: Z whose bars are arrows (swap motif) -->
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#6366F1"/>
+      <stop offset="1" stop-color="#3730A3"/>
+    </linearGradient>
+  </defs>
+  <rect x="8" y="8" width="112" height="112" rx="26" fill="url(#bg)"/>
+  <path d="M 48 34 H 92 V 47 L 56 81 H 80 V 94 H 36 V 81 L 72 47 H 48 Z" fill="#fff"/>
+  <path d="M 24 40.5 L 52 21 V 60 Z" fill="#fff"/>
+  <path d="M 104 87.5 L 76 68 V 107 Z" fill="#fff"/>
+</svg>

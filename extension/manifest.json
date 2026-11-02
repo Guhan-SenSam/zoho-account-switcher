@@ -1,0 +1,47 @@
+{
+  "manifest_version": 3,
+  "name": "Zoho Account Switcher",
+  "version": "1.0.0",
+  "description": "Keep several Zoho accounts in one Chrome profile and switch between them in a click.",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAp9z0d/uTD7ULz+drLZBDz1TzaBam/w5+dt3MNx2OcAhLxK6Y7BrtLrzeUggqFnqdPRw5g51XQX+m9nMS16XmYQWxr4HldpVtb3n6mECr4ALdTyIguszDo9TTwOMsUjVJIdSA6q2pgt7Zp39SCyCf3pHFs2LsD9XiOcwvXCqrmjceSeWyGSjQIUauhmFSo0AzxBK+hopfm6KTlJ+qXm78/Ikzru+JaKEDOBGNfaJ1n2AsShQXOp+Bu6orQW1Mry6fUE76nC8zdd/aFJi+X5OBtxNmFYmJPhbElczTw0A4aNgCXZZG1i0b5xWhGP5+yF7iKUiF9YfYItQQr3s1LIYgdwIDAQAB",
+  "permissions": ["cookies", "storage", "scripting", "browsingData"],
+  "host_permissions": [
+    "*://*.zoho.com/*",
+    "*://*.zoho.in/*",
+    "*://*.zoho.eu/*",
+    "*://*.zoho.com.au/*",
+    "*://*.zoho.jp/*",
+    "*://*.zoho.com.cn/*",
+    "*://*.zoho.sa/*",
+    "*://*.zoho.uk/*",
+    "*://*.zohocloud.ca/*"
+  ],
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "action": {
+    "default_popup": "popup/popup.html",
+    "default_title": "Zoho Account Switcher",
+    "default_icon": {
+      "16": "icons/icon-16.png",
+      "32": "icons/icon-32.png",
+      "48": "icons/icon-48.png",
+      "128": "icons/icon-128.png"
+    }
+  },
+  "icons": {
+    "16": "icons/icon-16.png",
+    "32": "icons/icon-32.png",
+    "48": "icons/icon-48.png",
+    "128": "icons/icon-128.png"
+  },
+  "commands": {
+    "_execute_action": {
+      "suggested_key": {
+        "default": "Alt+Shift+Z"
+      },
+      "description": "Open Zoho Account Switcher"
+    }
+  }
+}

@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="color-scheme" content="light dark">
+  <title>Popup harness</title>
+  <style>
+    :root { color-scheme: light dark; --bg: #e9ebef; --card: #ffffff; --text: #1d2026; --muted: #646c78; }
+    @media (prefers-color-scheme: dark) { :root { --bg: #121315; --card: #1f2023; --text: #e8eaed; --muted: #9ba1aa; } }
+    body { margin: 0; padding: 20px; background: var(--bg); color: var(--text); font: 13px/1.4 system-ui, sans-serif; }
+    h1 { margin: 0 0 4px; font-size: 16px; }
+    p { margin: 0 0 16px; color: var(--muted); }
+    .grid { display: flex; flex-wrap: wrap; gap: 20px; align-items: flex-start; }
+    figure { margin: 0; }
+    figcaption { margin-bottom: 6px; font-weight: 600; }
+    figcaption a { color: inherit; font-weight: 400; color: var(--muted); margin-left: 6px; }
+    iframe { display: block; width: 320px; height: 460px; border: 0; border-radius: 10px; background: var(--card);
+      box-shadow: 0 2px 10px rgba(0, 0, 0, .15); }
+  </style>
+  <script type="module" src="index.js"></script>
+</head>
+<body>
+  <h1>Zoho Account Switcher — popup harness</h1>
+  <p>The real <code>extension/popup/popup.html</code> against a stubbed background (<code>stub.js</code>).
+     Every frame is interactive. Light/dark follows your OS or <code>--force-dark-mode</code>.
+     Served by <code>node test/popup-harness/serve.mjs</code>.</p>
+  <div class="grid" id="grid"></div>
+</body>
+</html>
