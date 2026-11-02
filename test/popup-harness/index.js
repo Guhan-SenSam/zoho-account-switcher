@@ -6,6 +6,7 @@ const SCENARIOS = [
   ['pending', 'Adding an account'],
   ['pending-first', 'Adding the first account'],
   ['no-active', 'No active account'],
+  ['no-active&click=switch@a2', 'Confirm switch (unsaved session)'],
   ['empty', 'First run (no accounts)'],
   ['error', 'Error message'],
   ['warning', 'Switch warnings'],

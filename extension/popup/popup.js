@@ -6,6 +6,13 @@
 // re-renders from it. User-provided text is only ever inserted via text nodes.
 
 const NAME_ERROR = 'Name must be 1–40 characters';
+/** Same rule as the store (lib/accounts.js): 1–40 Unicode code points after trim. */
+const NAME_MAX = 40;
+/**
+ * `maxlength` counts UTF-16 code units and a code point is at most two, so 80
+ * never blocks a name the store accepts; validName() enforces the real limit.
+ */
+const NAME_MAXLENGTH = String(NAME_MAX * 2);
 const POLL_MS = 400;
 
 const BUSY_LABELS = {
@@ -28,9 +35,9 @@ const ui = {
   busyLabel: '',
   /** The user request currently in flight (for row-level "Switching…" feedback). */
   op: null,
-  /** Row that has its ⋯ menu / rename form / remove confirmation open. */
+  /** Row that has its ⋯ menu / rename form / remove or switch confirmation open. */
   rowId: null,
-  /** null | 'menu' | 'rename' | 'confirm' */
+  /** null | 'menu' | 'rename' | 'confirm' (remove) | 'confirm-switch' */
   rowMode: null,
   drafts: { pending: '', saveCurrent: '', rename: '' },
   /** null | { kind: 'error' | 'warning', lines: string[] } */
@@ -142,7 +149,18 @@ function accountById(id) {
 
 function validName(raw) {
   const name = String(raw ?? '').trim();
-  return name.length >= 1 && name.length <= 40 ? name : null;
+  const length = [...name].length; // code points, not UTF-16 units
+  return length >= 1 && length <= NAME_MAX ? name : null;
+}
+
+/**
+ * True while the "Save this session as" panel is offered next to the list: no
+ * account is active, so the browser may be signed in to a Zoho account that
+ * isn't saved, and switching would sign it out.
+ */
+function switchNeedsConfirm(state = ui.state) {
+  return Boolean(state) && !state.pending && state.activeId == null
+    && Array.isArray(state.accounts) && state.accounts.length > 0;
 }
 
 function showError(text, focus) {
@@ -158,7 +176,27 @@ function onSwitch(account) {
     return;
   }
   closeRow();
+  if (switchNeedsConfirm()) {
+    openRow(account.id, 'confirm-switch');
+    render({ focus: { testid: 'cancel-switch', id: account.id } });
+    return;
+  }
   request({ type: 'switch', id: account.id }, { focus: { testid: 'switch', id: account.id } });
+}
+
+function onConfirmSwitch(account) {
+  if (isBusy()) return;
+  closeRow();
+  // Move focus to the row's own switch button first, so it stays on this row
+  // whether the switch succeeds or fails.
+  const focus = { testid: 'switch', id: account.id };
+  render({ focus });
+  request({ type: 'switch', id: account.id }, { focus });
+}
+
+function onCancelSwitch(account) {
+  closeRow();
+  render({ focus: { testid: 'switch', id: account.id } });
 }
 
 function onToggleMenu(account) {
@@ -231,6 +269,7 @@ function onCancelAdd() {
 }
 
 function onSaveCurrent() {
+  closeRow(); // e.g. a switch confirmation that was open when Save was clicked
   const name = validName(ui.drafts.saveCurrent);
   if (!name) return showError(NAME_ERROR, { testid: 'save-current-name' });
   request({ type: 'saveCurrentAs', name }, {
@@ -361,6 +400,7 @@ function render({ focus = null } = {}) {
     const accounts = Array.isArray(state.accounts) ? state.accounts : [];
     if (ui.rowId && !accounts.some((a) => a.id === ui.rowId)) closeRow();
     if (state.pending) closeRow();
+    if (ui.rowMode === 'confirm-switch' && !switchNeedsConfirm(state)) closeRow();
 
     const views = [];
     if (state.pending) {
@@ -395,7 +435,7 @@ function renderPending(state, accounts) {
     id: 'new-account-name',
     testid: 'new-account-name',
     class: 'input',
-    maxlength: '40',
+    maxlength: NAME_MAXLENGTH,
     autocomplete: 'off',
     spellcheck: 'false',
     placeholder: 'e.g. Work, Personal, Client X',
@@ -441,7 +481,7 @@ function renderSaveCurrent(accounts) {
           id: 'save-current-name',
           testid: 'save-current-name',
           class: 'input',
-          maxlength: '40',
+          maxlength: NAME_MAXLENGTH,
           autocomplete: 'off',
           spellcheck: 'false',
           placeholder: 'Account name',
@@ -543,6 +583,16 @@ function renderAccount(account, active) {
         h('button', { type: 'button', class: 'btn btn-sm btn-danger', testid: 'confirm-remove', onclick: () => onConfirmRemove(account) }, 'Remove'),
       ),
     ));
+  } else if (open === 'confirm-switch') {
+    const textId = `switch-warning-${account.id}`;
+    li.append(h('div', { class: 'row-extra confirm', role: 'group', 'aria-label': `Switch to ${account.name}`, 'aria-describedby': textId },
+      h('p', { class: 'confirm-text', id: textId },
+        h('strong', null, "Your current Zoho session isn't saved"), ' — switching will sign it out.'),
+      h('div', { class: 'actions' },
+        h('button', { type: 'button', class: 'btn btn-sm', testid: 'cancel-switch', onclick: () => onCancelSwitch(account) }, 'Cancel'),
+        h('button', { type: 'button', class: 'btn btn-sm btn-danger', testid: 'confirm-switch', onclick: () => onConfirmSwitch(account) }, 'Switch anyway'),
+      ),
+    ));
   }
   return li;
 }
@@ -558,7 +608,7 @@ function renderRenameForm(account) {
       type: 'text',
       class: 'input input-sm',
       testid: 'rename-input',
-      maxlength: '40',
+      maxlength: NAME_MAXLENGTH,
       autocomplete: 'off',
       spellcheck: 'false',
       'aria-label': `New name for ${account.name}`,
@@ -630,9 +680,11 @@ els.messageDismiss.addEventListener('click', () => {
 document.addEventListener('keydown', (e) => {
   if (e.key !== 'Escape' || !ui.rowId) return;
   const id = ui.rowId;
+  // A cancelled switch confirmation returns to the row it was opened from.
+  const testid = ui.rowMode === 'confirm-switch' ? 'switch' : 'menu';
   e.preventDefault(); // keep the popup open; Esc only closes the row's menu
   closeRow();
-  render({ focus: { testid: 'menu', id } });
+  render({ focus: { testid, id } });
 });
 
 document.addEventListener('click', (e) => {
@@ -640,6 +692,10 @@ document.addEventListener('click', (e) => {
   // Ignore clicks on nodes a handler just replaced; they no longer describe where the user is.
   if (!e.target.isConnected) return;
   if (e.target.closest('[data-id]')?.dataset.id === ui.rowId) return;
+  // Re-rendering here would detach the clicked submit button's form before the
+  // browser submits it (and the submit would be dropped); the submit handler
+  // closes the row itself.
+  if (e.target.closest('#main form button[type="submit"]')) return;
   closeRow();
   render();
 });

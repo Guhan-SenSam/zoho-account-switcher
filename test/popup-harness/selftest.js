@@ -26,6 +26,9 @@
   const key = (el, k) => el.dispatchEvent(new KeyboardEvent('keydown', { key: k, bubbles: true, cancelable: true }));
   const activeId = () => $('[data-testid="account"][data-active="true"]')?.dataset.id ?? null;
   const visible = (el) => Boolean(el) && el.getClientRects().length > 0;
+  /** Requests the popup has sent to the stub so far (see stub.js). */
+  const sent = () => window.__stub.sent;
+  const sentSince = (n) => sent().slice(n).map((m) => JSON.stringify(m)).join(' ') || 'nothing';
 
   async function step(name, fn) {
     try {
@@ -122,6 +125,32 @@
       key(tid('rename-input', 'a3'), 'Escape');
     });
 
+    await step('name length counts code points like the store; maxlength 80', async () => {
+      tid('menu', 'a3').click();
+      tid('rename', 'a3').click();
+      let input = tid('rename-input', 'a3');
+      check(input.maxLength === 80, `rename-input maxlength should be 80, got ${input.maxLength}`);
+      const before = sent().length;
+      for (const tooLong of ['a'.repeat(41), '😀'.repeat(41)]) {
+        input = tid('rename-input', 'a3');
+        type(input, tooLong);
+        input.form.requestSubmit();
+        check(/Name must be 1–40 characters/.test(tid('message').textContent), `${[...tooLong].length} code points rejected`);
+        check(sent().length === before, `no request for a too-long name, sent ${sentSince(before)}`);
+      }
+      // 40 code points = 80 UTF-16 units: the store accepts it, so the popup must too.
+      const emoji = '😀'.repeat(40);
+      input = tid('rename-input', 'a3');
+      type(input, `  ${emoji}  `);
+      input.form.requestSubmit();
+      check(document.body.dataset.busy === 'true', '40 emoji accepted (request started)');
+      const last = sent().at(-1);
+      check(last?.type === 'rename' && last.name === emoji, `sent trimmed name, got ${sentSince(before)}`);
+      await idle();
+      check($('[data-id="a3"] .name').textContent === emoji, 'saved');
+      check(!visible(tid('message')), 'no error');
+    });
+
     await step('remove: confirm step then removal', async () => {
       tid('menu', 'a4').click();
       tid('remove', 'a4').click();
@@ -140,6 +169,53 @@
       await idle();
       check(activeId() === null, 'no active account');
       check(tid('save-current-panel') && tid('save-current-name') && tid('save-current'), 'save-current panel');
+      check(tid('save-current-name').maxLength === 80, `save-current-name maxlength should be 80, got ${tid('save-current-name').maxLength}`);
+    });
+
+    await step('no active account: switch asks for confirmation instead of switching', async () => {
+      const before = sent().length;
+      tid('switch', 'a1').click();
+      check(document.body.dataset.busy === 'false', 'no request started');
+      check(sent().length === before, `nothing sent, got ${sentSince(before)}`);
+      check(tid('confirm-switch', 'a1') instanceof HTMLButtonElement, 'confirm-switch button on the row');
+      check(tid('cancel-switch', 'a1') instanceof HTMLButtonElement, 'cancel-switch button on the row');
+      check($$('[data-testid="confirm-switch"]').length === 1, 'only on the clicked row');
+      check(/Your current Zoho session isn't saved — switching will sign it out\./.test($('[data-id="a1"]').textContent), 'explains why');
+      check(tid('confirm-switch', 'a1').textContent === 'Switch anyway', 'confirm label');
+      check(tid('cancel-switch', 'a1').textContent === 'Cancel', 'cancel label');
+      check(tid('switch', 'a1') && tid('menu', 'a1'), 'row keeps switch/menu');
+      check(document.activeElement === tid('cancel-switch', 'a1'), 'focus on Cancel');
+      check(tid('save-current-panel'), 'save panel still shown');
+    });
+
+    await step('cancel-switch sends nothing', async () => {
+      const before = sent().length;
+      tid('cancel-switch', 'a1').click();
+      await wait(50);
+      check(!tid('confirm-switch') && !tid('cancel-switch'), 'confirmation closed');
+      check(sent().length === before, `nothing sent, got ${sentSince(before)}`);
+      check(activeId() === null, 'still no active account');
+      check(document.activeElement === tid('switch', 'a1'), 'focus back on the row');
+    });
+
+    await step('Escape cancels the switch confirmation', async () => {
+      const before = sent().length;
+      tid('switch', 'a3').click();
+      check(tid('confirm-switch', 'a3'), 'confirmation open');
+      key(document.activeElement, 'Escape');
+      await wait(50);
+      check(!tid('confirm-switch'), 'closed by Escape');
+      check(sent().length === before, `nothing sent, got ${sentSince(before)}`);
+      check(document.activeElement === tid('switch', 'a3'), 'focus back on the row');
+    });
+
+    await step('Save in the panel still submits while a switch confirmation is open', async () => {
+      tid('switch', 'a1').click();
+      check(tid('confirm-switch', 'a1'), 'confirmation open');
+      type(tid('save-current-name'), '');
+      tid('save-current').click();
+      check(visible(tid('message')) && /Name must be 1–40 characters/.test(tid('message').textContent), 'form submitted (validation ran)');
+      check(!tid('confirm-switch'), 'confirmation closed');
     });
 
     await step('save current session', async () => {
@@ -151,12 +227,46 @@
       check(active?.textContent === 'Recovered', 'new account active');
     });
 
+    await step('with an active account a click switches directly', async () => {
+      const before = sent().length;
+      tid('switch', 'a1').click();
+      check(document.body.dataset.busy === 'true', 'request started immediately');
+      check(!tid('confirm-switch'), 'no confirmation');
+      const s = sent().slice(before);
+      check(s.length === 1 && s[0].type === 'switch' && s[0].id === 'a1', `sent switch a1, got ${sentSince(before)}`);
+      await idle();
+      check(activeId() === 'a1', `active should be a1, got ${activeId()}`);
+    });
+
+    await step('confirm-switch sends switch', async () => {
+      // Back to "no active account" by removing the active one.
+      tid('menu', 'a1').click();
+      tid('remove', 'a1').click();
+      tid('confirm-remove', 'a1').click();
+      await idle();
+      check(activeId() === null && tid('save-current-panel'), 'no active account again');
+      const before = sent().length;
+      tid('switch', 'a3').click();
+      check(sent().length === before, `nothing sent on the first click, got ${sentSince(before)}`);
+      tid('confirm-switch', 'a3').click();
+      check(document.body.dataset.busy === 'true', 'busy while switching');
+      const s = sent().slice(before);
+      check(s.length === 1 && s[0].type === 'switch' && s[0].id === 'a3', `sent switch a3, got ${sentSince(before)}`);
+      check(!tid('confirm-switch'), 'confirmation closed while switching');
+      check($('[data-id="a3"]').classList.contains('is-switching'), 'row shows Switching…');
+      await idle();
+      check(activeId() === 'a3', `active should be a3, got ${activeId()}`);
+      check(!tid('save-current-panel'), 'save panel gone');
+      check(document.activeElement === tid('switch', 'a3'), 'focus on the switched row');
+    });
+
     await step('add account → pending view → validation → finish', async () => {
       tid('add-account').click();
       await idle();
       check(tid('pending-panel') && tid('new-account-name') && tid('finish-add') && tid('cancel-add'), 'pending view');
       check(!$('[data-testid="account"]'), 'list hidden while pending');
       check(document.activeElement === tid('new-account-name'), 'name input focused');
+      check(tid('new-account-name').maxLength === 80, `new-account-name maxlength should be 80, got ${tid('new-account-name').maxLength}`);
       tid('finish-add').click();
       check(/Name must be 1–40 characters/.test(tid('message').textContent), 'empty name rejected');
       type(tid('new-account-name'), 'Fresh');

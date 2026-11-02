@@ -7,6 +7,9 @@
 //   delay=<ms>               simulated background latency (default 500)
 //   click=<testid>@<id>,...  clicks to perform after the first render, in order
 //                            (e.g. click=menu@a2,rename@a2); `@id` is optional
+//
+// Every request is also recorded in `window.__stub.sent` (at call time) so the
+// self-test can assert exactly what the popup sent.
 (() => {
   const params = new URLSearchParams(location.search);
   const DELAY = Number(params.get('delay') ?? 500);
@@ -79,9 +82,11 @@
     const raw = words.length > 1 ? words[0][0] + words[1][0] : words[0].slice(0, 2);
     return raw.toUpperCase();
   };
+  // Mirrors validName in extension/lib/accounts.js: 1–40 Unicode code points after trim.
   const checkName = (name) => {
     const n = String(name ?? '').trim();
-    if (n.length < 1 || n.length > 40) throw new Error('Name must be 1–40 characters');
+    const length = [...n].length;
+    if (length < 1 || length > 40) throw new Error('Name must be 1–40 characters');
     return n;
   };
   const need = (cond, msg) => { if (!cond) throw new Error(msg); };
@@ -145,8 +150,12 @@
     },
   };
 
+  const sent = [];
+  window.__stub = { sent };
+
   let firstGetState = true;
   async function sendMessage(msg) {
+    sent.push(structuredClone(msg));
     await new Promise((r) => setTimeout(r, msg.type === 'getState' && firstGetState ? 150 : DELAY));
     const state = () => structuredClone(db);
     console.log('[stub] →', JSON.stringify(msg));

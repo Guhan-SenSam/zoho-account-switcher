@@ -525,6 +525,7 @@ body[data-busy="true"] .busy-indicator {
 
 .account.is-menu,
 .account.is-confirm,
+.account.is-confirm-switch,
 .account.is-rename {
   background: var(--surface);
   box-shadow: var(--shadow-ring);

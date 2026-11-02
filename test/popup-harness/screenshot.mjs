@@ -24,6 +24,7 @@ const SHOTS = {
   confirm: ['scenario=list&click=menu@a3,remove@a3', 440],
   pending: ['scenario=pending', 400],
   'no-active': ['scenario=no-active', 480],
+  'confirm-switch': ['scenario=no-active&click=switch@a2', 560],
   empty: ['scenario=empty', 440],
   error: ['scenario=error', 400],
   warning: ['scenario=warning', 430],
