@@ -159,6 +159,52 @@ export async function launchBrowser({ extDir = EXT_DIR, port, userDataDir = make
       return h.swEval((d) => chrome.cookies.getAll({ domain: d }), domain);
     },
 
+    /** Drop the cached driver page (e.g. after the extension was reloaded). */
+    async resetDriver() {
+      if (driverPage && !driverPage.isClosed()) await driverPage.close().catch(() => {});
+      driverPage = null;
+    },
+
+    /** chrome.extension.isAllowedIncognitoAccess() as seen by the extension. */
+    incognitoAllowed() {
+      return h.swEval(() => chrome.extension.isAllowedIncognitoAccess());
+    },
+
+    /**
+     * Turn on "Allow in Incognito" for the extension, like the user would on
+     * chrome://extensions. An extension loaded with --load-extension is not allowed
+     * in Incognito by default and there is no command-line switch for it, so this
+     * calls chrome.developerPrivate (the API behind chrome://extensions) from a
+     * chrome://extensions page in this same browser.
+     *
+     * Toggling Incognito access reloads the extension. Chromium disables a reloaded
+     * unpacked extension as "unsupportedDeveloperExtension" unless developer mode is
+     * on, so developer mode is switched on first. After the reload the service
+     * worker and every extension page are new: the cached driver page is dropped
+     * and the call waits until the new service worker reports Incognito access.
+     */
+    async enableIncognito() {
+      const page = await context.newPage();
+      try {
+        await page.goto('chrome://extensions/');
+        await page.evaluate(async (id) => {
+          await chrome.developerPrivate.updateProfileConfiguration({ inDeveloperMode: true });
+          await chrome.developerPrivate.updateExtensionConfiguration({ extensionId: id, incognitoAccess: true });
+        }, extensionId);
+        const info = await pollUntil(async () => {
+          const i = await page.evaluate((id) => chrome.developerPrivate.getExtensionInfo(id), extensionId);
+          return i.state === 'ENABLED' && i.incognitoAccess?.isActive ? i : null;
+        }, { message: 'extension re-enabled with Incognito access (chrome://extensions)' });
+        assert.equal(info.incognitoAccess.isEnabled, true, 'Incognito access can be enabled (manifest "incognito" is not "not_allowed")');
+      } finally {
+        await page.close().catch(() => {});
+      }
+      await h.resetDriver();
+      await pollUntil(() => h.incognitoAllowed().catch(() => false),
+        { message: 'service worker reports isAllowedIncognitoAccess() === true' });
+      await h.driver();
+    },
+
     async close() {
       await context.close().catch(() => {});
     },
@@ -289,4 +335,134 @@ export async function waitIdle(b, timeout = 10_000) {
 export function extensionPresent(dir = EXT_DIR) {
   const need = ['manifest.json', 'background.js', 'popup/popup.html'];
   return need.every((f) => fs.existsSync(path.join(dir, f)));
+}
+
+// ---------------------------------------------------------------------------
+// Incognito ("private window") helpers.
+//
+// Incognito tabs live in Chromium's off-the-record profile; tests do not rely on
+// Playwright exposing them. Everything below goes through the extension's own
+// service worker (chrome.windows / chrome.tabs / chrome.scripting / chrome.cookies
+// with an explicit storeId), which works once the extension is allowed in
+// Incognito (b.enableIncognito()).
+
+export const REGULAR_STORE_ID = '0';
+export const ZOHO_TEST_DOMAINS = ['zoho.com', 'zoho.in'];
+
+/** chrome.windows.getAll() summarised: [{ id, incognito, type }]. */
+export function allWindows(b) {
+  return b.swEval(async () => (await chrome.windows.getAll({ populate: false }))
+    .map((w) => ({ id: w.id, incognito: w.incognito, type: w.type })));
+}
+
+/** Ids of the open Incognito windows. */
+export async function incognitoWindowIds(b) {
+  return (await allWindows(b)).filter((w) => w.incognito).map((w) => w.id);
+}
+
+/** chrome.cookies.getAllCookieStores(): [{ id, tabIds }]. */
+export function cookieStores(b) {
+  return b.swEval(() => chrome.cookies.getAllCookieStores());
+}
+
+/**
+ * Zoho cookies (zoho.com + zoho.in) in a cookie store, or null if that store no
+ * longer exists (an off-the-record store disappears with the last Incognito window).
+ */
+export function storeCookies(b, storeId, domains = ZOHO_TEST_DOMAINS) {
+  return b.swEval(async ({ storeId, domains }) => {
+    const stores = await chrome.cookies.getAllCookieStores();
+    if (!stores.some((s) => s.id === storeId)) return null;
+    const out = [];
+    for (const domain of domains) out.push(...await chrome.cookies.getAll({ domain, storeId }));
+    return out;
+  }, { storeId, domains });
+}
+
+/** Stable fingerprint of the regular store's Zoho cookies (name/domain/path=value). */
+export async function regularJar(b) {
+  const list = (await storeCookies(b, REGULAR_STORE_ID)) ?? [];
+  return list.map((c) => `${c.name}|${c.domain}|${c.path}=${c.value}`).sort();
+}
+
+/** The cookie store that holds a tab (by tabId). */
+export async function storeOfTab(b, tabId) {
+  const stores = await cookieStores(b);
+  return stores.find((s) => s.tabIds.includes(tabId))?.id ?? null;
+}
+
+/** Open an Incognito window from the service worker (as the test, not the extension). */
+export function openIncognitoWindow(b, url) {
+  return b.swEval(async (u) => {
+    const w = await chrome.windows.create({ incognito: true, focused: false, ...(u ? { url: u } : {}) });
+    return { windowId: w.id, tabId: w.tabs?.[0]?.id ?? null };
+  }, url);
+}
+
+/** Close a window from the service worker; true if it existed. */
+export function closeWindow(b, windowId) {
+  return b.swEval(async (id) => {
+    try { await chrome.windows.remove(id); return true; } catch { return false; }
+  }, windowId);
+}
+
+/** The first tab of a window once it has finished loading a URL starting with `prefix`. */
+export function waitForTabInWindow(b, windowId, prefix, { timeout = 10_000 } = {}) {
+  return pollUntil(() => b.swEval(async ({ windowId, prefix }) => {
+    const tabs = await chrome.tabs.query({ windowId });
+    const t = tabs.find((x) => (x.url ?? '').startsWith(prefix));
+    return t && t.status === 'complete'
+      ? { tabId: t.id, url: t.url, incognito: t.incognito, windowId: t.windowId }
+      : null;
+  }, { windowId, prefix }), { timeout, message: `tab at ${prefix} in window ${windowId}` });
+}
+
+/** Like readPage(), but for any tab (incl. Incognito) via chrome.scripting from the SW. */
+export function readTab(b, tabId) {
+  return pollUntil(() => b.swEval(async (id) => {
+    const [r] = await chrome.scripting.executeScript({
+      target: { tabId: id },
+      func: () => (document.body?.dataset.ready === 'true' || document.getElementById('who')
+        ? {
+          who: document.getElementById('who')?.textContent ?? null,
+          serial: document.getElementById('serial')?.textContent ?? null,
+          ss: document.getElementById('ss')?.textContent ?? null,
+          ls: document.getElementById('ls')?.textContent ?? null,
+          reason: document.getElementById('reason')?.textContent ?? null,
+          url: location.href,
+        }
+        : null),
+    });
+    return r?.result ?? null;
+  }, tabId), { message: `fake Zoho page rendered in tab ${tabId}` });
+}
+
+/**
+ * Sign in on the fake Zoho form in a tab of `windowId` (typically the extension's
+ * private window), driven from the service worker. Returns
+ * { tabId, storeId, incognito, mail } where mail is the landing page's readTab().
+ */
+export async function signInInWindow(b, windowId, username) {
+  const tab = await waitForTabInWindow(b, windowId, SIGN_IN);
+  const title = await b.swEval(async ({ tabId, username }) => {
+    const [r] = await chrome.scripting.executeScript({
+      target: { tabId },
+      args: [username],
+      func: (u) => {
+        const t = document.getElementById('signin-title')?.textContent ?? null;
+        if (!t) return null;
+        document.getElementById('username').value = u;
+        document.getElementById('signin-form').submit();
+        return t;
+      },
+    });
+    return r?.result ?? null;
+  }, { tabId: tab.tabId, username });
+  assert.equal(title, 'Sign in to Zoho', `sign-in form shown in window ${windowId}`);
+  await pollUntil(() => b.swEval(async ({ id, mail }) => {
+    const t = await chrome.tabs.get(id);
+    return t.status === 'complete' && (t.url ?? '').startsWith(mail);
+  }, { id: tab.tabId, mail: MAIL }), { message: `tab ${tab.tabId} in window ${windowId} to land on ${MAIL} after signing in as ${username}` });
+  const mail = await readTab(b, tab.tabId);
+  return { tabId: tab.tabId, incognito: tab.incognito, storeId: await storeOfTab(b, tab.tabId), mail };
 }

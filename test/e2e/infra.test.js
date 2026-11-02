@@ -8,6 +8,8 @@ import fs from 'node:fs';
 import path from 'node:path';
 import {
   TMP, MAIL, SIGN_IN, WHOAMI, setup, launchBrowser, readPage, submitSignIn, waitForRerender, pollUntil,
+  REGULAR_STORE_ID, cookieStores, storeCookies, openIncognitoWindow, signInInWindow, closeWindow,
+  incognitoWindowIds, readTab, cookieValue,
 } from './helpers.js';
 
 const DUMMY = path.join(TMP, 'dummy-ext');
@@ -201,4 +203,54 @@ test('infra: browser restart keeps storage + persistent cookies, drops session c
     await pollUntil(async () => (await b2.storage('events')).events?.some((e) => e.type === 'onStartup'),
       { message: 'onStartup listener ran after dispatch()' });
   }
+});
+
+test('infra: Incognito access via chrome://extensions; an Incognito tab driven from the SW', { timeout: 90_000 }, async (t) => {
+  writeDummyExtension(); // no "incognito" key: defaults to "spanning"
+  const env = await setup({ extDir: DUMMY });
+  t.after(() => env.close());
+  const b = env.browser;
+
+  // --load-extension does not allow the extension in Incognito.
+  assert.equal(await b.incognitoAllowed(), false, 'not allowed in Incognito by default');
+  // A regular-profile session, to prove the stores stay separate.
+  const page = await b.context.newPage();
+  await page.goto(SIGN_IN);
+  assert.equal((await submitSignIn(page, 'alice')).who, 'alice');
+  const aliceAdt = env.server.sessionFor('alice').adt;
+
+  await b.enableIncognito();
+  assert.equal(await b.incognitoAllowed(), true, 'allowed in Incognito after developerPrivate toggle');
+  assert.equal((await b.send({ type: 'cookies' })).ok, true, 'driver page works against the reloaded extension');
+
+  // The SW can open an Incognito window; host-resolver mapping + cert handling apply there too.
+  const { windowId } = await openIncognitoWindow(b, SIGN_IN);
+  assert.deepEqual(await incognitoWindowIds(b), [windowId]);
+  const signed = await signInInWindow(b, windowId, 'carol');
+  assert.equal(signed.incognito, true, 'the tab is an Incognito tab');
+  assert.equal(signed.mail.who, 'carol', 'Incognito mail shows carol');
+  assert.equal(signed.mail.url, MAIL, 'Incognito tab reached https://mail.zoho.com/ (no port)');
+  assert.ok(signed.storeId && signed.storeId !== REGULAR_STORE_ID, `Incognito store id: ${signed.storeId}`);
+  assert.deepEqual((await cookieStores(b)).map((s) => s.id).sort(), [REGULAR_STORE_ID, signed.storeId].sort());
+
+  const carol = env.server.sessionFor('carol');
+  const inc = await storeCookies(b, signed.storeId);
+  assert.deepEqual(inc.map((c) => c.name).sort(), ['JSESSIONID', '__Host-zmcsr', '_iamadt', '_iambdt', 'iamcsr']);
+  assert.ok(inc.every((c) => c.storeId === signed.storeId));
+  assert.equal(cookieValue(inc, '_iamadt'), carol.adt);
+  assert.equal(cookieValue(inc, '_iambdt'), carol.bdt, 'Incognito store holds the post-rotation token');
+  // The regular store is untouched; a regular reload is still alice.
+  const reg = await storeCookies(b, REGULAR_STORE_ID);
+  assert.equal(cookieValue(reg, '_iamadt'), aliceAdt);
+  await page.reload();
+  assert.equal((await readPage(page)).who, 'alice');
+  // readTab works on the Incognito tab after a reload too.
+  await b.swEval((id) => chrome.tabs.reload(id), signed.tabId);
+  await pollUntil(async () => (await readTab(b, signed.tabId)).serial !== signed.mail.serial, { message: 'Incognito tab re-rendered' });
+  assert.equal((await readTab(b, signed.tabId)).who, 'carol');
+
+  // Closing the last Incognito window drops the off-the-record store.
+  assert.equal(await closeWindow(b, windowId), true);
+  await pollUntil(async () => (await incognitoWindowIds(b)).length === 0, { message: 'no Incognito window' });
+  await pollUntil(async () => (await storeCookies(b, signed.storeId)) === null, { message: 'Incognito cookie store gone' });
 });
