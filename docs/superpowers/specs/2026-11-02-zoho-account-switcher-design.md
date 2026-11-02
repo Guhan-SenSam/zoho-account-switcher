@@ -285,3 +285,96 @@ These supersede the contracts above where they differ.
   (`switcher.isLocked()`), at most 10 s after the first unsynced change.
 - **Manifest:** fixed `key` (id `cdejiijaefadneogcpfoadhdenpfgano`),
   `"incognito": "not_allowed"`. Message router lives in `lib/router.js`.
+
+## Addendum: add accounts in a private window (2026-11-02)
+
+**Problem.** "Add account" signs the browser out of Zoho, so the user loses the
+Zoho Vault web app they need for the other account's password and 2FA. Signing
+in is slow (password, OTP, Vault), so it must happen once per account, without
+touching the current session.
+
+**Design.** When the extension is allowed in Incognito, "Add account" opens the
+Zoho sign-in page in an Incognito window. The current account stays signed in
+and active in the normal window, and keeps syncing. The user signs in there and
+clicks Save. The extension copies that Incognito cookie store's Zoho cookies
+into a new account, clears them from the Incognito store and closes the window.
+The active account doesn't change; the user switches to the new one when they
+want to. If Incognito access is off, the old sign-out flow is used and the popup
+offers a button to turn it on.
+
+### Contracts
+
+- **manifest:** `"incognito": "spanning"` (replaces `not_allowed`). One background
+  serves both profiles; it must only ever act on the regular store/tabs except
+  for the private-add flow.
+- **`lib/zoho-domains.js`:** add `export const REGULAR_STORE_ID = '0'`.
+- **`lib/cookie-jar.js`:** `snapshot({ storeId } = {})` and `clear({ storeId } = {})`
+  pass `storeId` to `getAll`/`remove` when given. Without it they behave as today
+  (regular store). `restore` is unchanged (regular store only).
+- **`lib/site-data.js`:** `listZohoTabs()` excludes `tab.incognito` tabs, so
+  `resetTabs` and `deepClean` never touch Incognito tabs.
+- **`lib/private-window.js` (new):**
+  ```js
+  export function createPrivateWindows({ windows, cookies, extension, tabs } = globalThis.chrome ?? {}) → {
+    isAllowed()                 // Promise<boolean>: extension.isAllowedIncognitoAccess()
+    open(url)                   // windows.create({ incognito: true, url, focused: true })
+                                // → { windowId, tabId, storeId }; storeId = the cookie store
+                                //   (cookies.getAllCookieStores()) whose tabIds include tabId
+    focus(windowId)             // → true, or false if the window is gone
+    close(windowId)             // windows.remove; ignores "no window" errors
+    isOpen(windowId)            // → boolean
+    openSettings()              // tabs.create({ url: `chrome://extensions/?id=${runtime id}` })
+  }
+  ```
+- **Pending (private mode)** in storage:
+  `{ mode: 'private', previousId, startedAt, windowId|null, storeId, capturedCookies? }`.
+  The existing sign-out flow's pending gets `mode: 'signout'`; a pending without
+  `mode` is treated as `'signout'` (old data). `setPending` validates both shapes.
+- **Switcher:**
+  - `beginAdd()`: if `privateWindows.isAllowed()` → private mode. If a private add
+    is already pending and its window is open → focus it. Otherwise open a new
+    window, clear Zoho cookies in its store (an Incognito store is shared by all
+    Incognito windows; a leftover Zoho session would hijack the sign-in), and set
+    pending. No snapshot/clear/reset of the regular jar; `activeId` unchanged.
+    Not allowed → today's sign-out flow. Returns `{ warnings, mode }`.
+  - `capturePrivate()`: when a private add is pending and its window is open,
+    snapshot its store; if non-empty, save it as `pending.capturedCookies`. Skipped
+    while another op runs (like `syncActive`).
+  - `privateWindowClosed(windowId)`: if it's the pending window, set
+    `pending.windowId = null` (keep pending so Save can use captured cookies).
+  - `finishAdd(name)` private: cookies = live snapshot of the store if the window
+    is open and the snapshot is non-empty, else `pending.capturedCookies`. If none
+    → `Error('Sign in to Zoho in the private window first')` (pending kept). Create
+    the account (does NOT change `activeId` or touch the regular jar), clear the
+    Zoho cookies in that store (if open), close the window, `pending = null`,
+    badge. Returns the account.
+  - `cancelAdd()` private: clear that store's Zoho cookies (if open), close the
+    window, `pending = null`, badge. Regular jar untouched, no tab reloads.
+  - `syncActive()` keeps running during a **private** pending (skips only for
+    `signout` pending). `switchTo` is still refused while any add is pending.
+- **background.js:**
+  - `cookies.onChanged`: `cookie.storeId === REGULAR_STORE_ID` → the existing
+    debounced `syncActive`. Otherwise, if a private add is pending and the
+    `storeId` matches → separately debounced (500 ms) `capturePrivate()`. Any other
+    store is ignored.
+  - `windows.onRemoved` → `switcher.privateWindowClosed(windowId)`.
+- **Protocol:**
+  - `state` gains `incognitoAllowed: boolean`.
+  - `state.pending` is `{ previousId, startedAt, mode, windowOpen, captured }`;
+    cookies and storeId are never sent to the popup.
+  - `finishAdd` in private mode returns extra
+    `notice: 'Saved “<name>”. Click it to switch.'`
+  - New message `openIncognitoSettings` → `privateWindows.openSettings()`.
+- **Popup:**
+  - **Pending, private:** "Sign in to the new Zoho account in the private window.
+    You stay signed in here." plus the name input, Save and Cancel (same testids).
+    If `!windowOpen`, say the private window was closed. If `captured` is also
+    true, add that Save will still work; otherwise say to reopen it. The footer
+    button (`add-account`) reads "Show private window" while the window is open,
+    "Reopen private window" when closed, and sends `beginAdd`.
+  - **Pending, signout:** unchanged.
+  - **Normal view, `!incognitoAllowed`:** a one-line hint under "+ Add account":
+    "Turn on Allow in Incognito to add accounts without signing out." with a button
+    `[data-testid="incognito-settings"]` that sends `openIncognitoSettings`.
+  - Any response `notice` shows in `[data-testid="message"]` with an info (not
+    error) style.
