@@ -1,0 +1,11 @@
+{
+  "name": "zoho-account-switcher",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Chrome extension to switch between multiple Zoho accounts in one profile",
+  "scripts": {
+    "test": "node --test \"test/unit/**/*.test.js\"",
+    "test:e2e": "node --test --test-concurrency=1 \"test/e2e/**/*.test.js\""
+  }
+}
