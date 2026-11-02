@@ -411,6 +411,66 @@ describe('createAccountStore', () => {
     });
   });
 
+  describe('pending: sign-out and private modes', () => {
+    test('a sign-out pending may carry mode: "signout"; old data without mode reads back unchanged', async () => {
+      const storage = createFakeStorage({ pending: { previousId: 'a', startedAt: 1 } });
+      const store = createAccountStore(storage);
+      assert.deepEqual(await store.getPending(), { previousId: 'a', startedAt: 1 }, 'old data is not rewritten');
+      const p = { mode: 'signout', previousId: null, startedAt: 2, previousCookies: [cookie('A')] };
+      assert.deepEqual(await store.setPending(p), p);
+      assert.deepEqual(storage.dump().pending, p);
+    });
+
+    test('a private pending round-trips (windowId number or null, storeId, optional capturedCookies)', async () => {
+      const storage = createFakeStorage();
+      const store = createAccountStore(storage);
+      const p = { mode: 'private', previousId: 'a', startedAt: 3, windowId: 12, storeId: '1' };
+      assert.deepEqual(await store.setPending(p), p);
+      assert.deepEqual(await store.getPending(), p);
+      const closed = { mode: 'private', previousId: null, startedAt: 3, windowId: null, storeId: '1', capturedCookies: [cookie('IAM')] };
+      assert.deepEqual(await store.setPending(closed), closed);
+      assert.deepEqual(storage.dump().pending, closed);
+    });
+
+    test('a private pending keeps only its own fields', async () => {
+      const store = createAccountStore(createFakeStorage());
+      const stored = await store.setPending({
+        mode: 'private', previousId: 'a', startedAt: 3, windowId: 1, storeId: '1', previousCookies: [cookie('x')], junk: 1,
+      });
+      assert.deepEqual(stored, { mode: 'private', previousId: 'a', startedAt: 3, windowId: 1, storeId: '1' });
+    });
+
+    test('capturedCookies are copied, not aliased', async () => {
+      const store = createAccountStore(createFakeStorage());
+      const captured = [cookie('IAM', 'v1')];
+      await store.setPending({ mode: 'private', previousId: null, startedAt: 1, windowId: 1, storeId: '1', capturedCookies: captured });
+      captured[0].value = 'changed';
+      assert.equal((await store.getPending()).capturedCookies[0].value, 'v1');
+    });
+
+    test('rejects malformed private pendings and unknown modes', async () => {
+      const store = createAccountStore(createFakeStorage());
+      const ok = { mode: 'private', previousId: 'a', startedAt: 3, windowId: 1, storeId: '1' };
+      for (const bad of [
+        { ...ok, mode: 'incognito' },
+        { ...ok, windowId: '1' },
+        { ...ok, windowId: undefined },
+        { ...ok, windowId: 1.5 },
+        { ...ok, storeId: undefined },
+        { ...ok, storeId: 1 },
+        { ...ok, storeId: '' },
+        { ...ok, capturedCookies: 'x' },
+        { ...ok, capturedCookies: null },
+        { ...ok, previousId: 3 },
+        { ...ok, startedAt: '3' },
+        { previousId: null, startedAt: 1, mode: null },
+      ]) {
+        await assert.rejects(store.setPending(bad), TypeError, JSON.stringify(bad));
+      }
+      assert.equal(await store.getPending(), null);
+    });
+  });
+
   describe('switching (switch-in-progress marker)', () => {
     test('get/set/clear; included in getState', async () => {
       const storage = createFakeStorage();

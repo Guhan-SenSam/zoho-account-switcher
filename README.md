@@ -16,6 +16,10 @@ Covers every Zoho data center: `zoho.com`, `.in`, `.eu`, `.com.au`, `.jp`,
 2. Turn on **Developer mode** (top right).
 3. Click **Load unpacked** and choose the `extension/` folder of this repo.
 
+4. Click **Details** on the extension's card and turn on **Allow in Incognito**.
+   That lets you add accounts in a private window without signing out of the
+   one you're on (see below). Without it, adding an account signs you out first.
+
 The manifest has a fixed key, so the extension id is always
 `cdejiijaefadneogcpfoadhdenpfgano` — your saved accounts survive moving or
 re-cloning the folder. After pulling changes, click the reload icon on the
@@ -27,10 +31,16 @@ Open the popup from the toolbar (pin it) or press **Alt+Shift+Z**.
 
 - **Already signed in?** On first run the popup offers *Save this session as…* —
   name it and you're done.
-- **Add account** → the extension signs the browser out of Zoho (your other
-  saved accounts are kept) and opens the Zoho sign-in page. Sign in however you
-  normally do, then name the account in the popup and **Save**. **Cancel** puts
-  you back on the previous account.
+- **Add account** (with *Allow in Incognito* on) → opens the Zoho sign-in page
+  in a private window. You stay signed in to your current account in the normal
+  window, so Zoho Vault is right there for the new account's password and 2FA.
+  Sign in, then open the popup (from either window), name the account and
+  **Save**. The private window closes; click the new account to switch to it.
+  If you close the private window before saving, the sign-in is kept and Save
+  still works. Any other Incognito windows get signed out of Zoho.
+- **Add account** (without *Allow in Incognito*) → the extension signs the
+  browser out of Zoho and opens the sign-in page in a normal tab. **Cancel**
+  puts you back on the previous account.
 - **Switch** → click an account. Every open Zoho tab reloads as that account.
   The toolbar badge shows the active account's initials and color.
 - **⋯ menu** → rename or remove an account. Removing only deletes the saved copy;

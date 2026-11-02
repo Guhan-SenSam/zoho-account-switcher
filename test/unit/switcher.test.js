@@ -666,7 +666,7 @@ test('beginAdd: the outgoing snapshot is guarded too', async () => {
   jar.live = [];
   await captureInfo(() => switcher.beginAdd());
   assert.deepEqual(store.state.accounts.A.cookies, ck('a-old'));
-  assert.deepEqual(store.state.pending, { previousId: 'A', startedAt: 1000 });
+  assert.deepEqual(store.state.pending, { mode: 'signout', previousId: 'A', startedAt: 1000 });
 });
 
 // ---------------------------------------------------------------------------
@@ -675,7 +675,7 @@ test('beginAdd: the outgoing snapshot is guarded too', async () => {
 
 test('beginAdd: saves active, marks pending, signs out, resets tabs, opens sign-in', async () => {
   const { log, store, jar, switcher } = setup();
-  await switcher.beginAdd();
+  assert.deepEqual(await switcher.beginAdd(), { warnings: [], mode: 'signout' });
   assert.deepEqual(names(log), [
     'jar.snapshot',
     'store.updateCookies',
@@ -687,7 +687,7 @@ test('beginAdd: saves active, marks pending, signs out, resets tabs, opens sign-
     'siteData.openSignIn',
   ]);
   assert.deepEqual(log[1], ['store.updateCookies', 'A', ck('a-live')]);
-  assert.deepEqual(log[2], ['store.setPending', { previousId: 'A', startedAt: 1000 }]);
+  assert.deepEqual(log[2], ['store.setPending', { mode: 'signout', previousId: 'A', startedAt: 1000 }]);
   assert.deepEqual(log[3], ['store.setActiveId', null]);
   assert.deepEqual(log[4], ['badge.show', null, true]);
   assert.deepEqual(jar.live, []);
@@ -706,13 +706,13 @@ test('beginAdd: with no active account and nothing live records previousId null 
   const { log, store, switcher } = setup({ activeId: null, live: [] });
   await switcher.beginAdd();
   assert.equal(names(log).includes('store.updateCookies'), false);
-  assert.deepEqual(store.state.pending, { previousId: null, startedAt: 1000 });
+  assert.deepEqual(store.state.pending, { mode: 'signout', previousId: null, startedAt: 1000 });
 });
 
 test('beginAdd: an unsaved signed-in session (no active account) is stashed in pending, not saved', async () => {
   const { log, store, jar, switcher } = setup({ activeId: null, live: ck('unsaved') });
   await switcher.beginAdd();
-  assert.deepEqual(store.state.pending, { previousId: null, startedAt: 1000, previousCookies: ck('unsaved') });
+  assert.deepEqual(store.state.pending, { mode: 'signout', previousId: null, startedAt: 1000, previousCookies: ck('unsaved') });
   assert.equal(names(log).includes('store.updateCookies'), false);
   assert.ok(names(log).indexOf('jar.snapshot') < names(log).indexOf('jar.clear'));
   assert.deepEqual(jar.live, []);

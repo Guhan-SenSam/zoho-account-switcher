@@ -23,6 +23,11 @@ export const KNOWN_SUBDOMAINS = Object.freeze([
 
 export const SIGN_IN_URL = 'https://accounts.zoho.com/signin';
 
+// chrome.cookies store of the regular (non-Incognito) profile. With
+// "incognito": "spanning" the background also sees the Incognito store; it
+// must only act on this one, except for the private "Add account" flow.
+export const REGULAR_STORE_ID = '0';
+
 /**
  * True if `hostname` is one of ZOHO_DOMAINS or a subdomain of one.
  * Matching is on whole labels, so `notzoho.com`, `zoho.com.evil.net` and

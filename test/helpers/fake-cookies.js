@@ -26,9 +26,19 @@
 //   Resolves with the details whether or not anything was deleted.
 // - Unknown properties in details throw synchronously, as Chrome's schema
 //   validation does ("Unexpected property").
+// - Cookie stores: every call takes an optional `storeId` (default '0', the
+//   regular profile); an unknown one rejects ('Invalid cookie store id: "1".').
+//   Returned cookies carry their storeId. `stores` lists the stores that exist
+//   at creation; addStore(id)/removeStore(id) model an Incognito profile coming
+//   and going (removing drops its cookies without events, like Chrome).
+//   getAllCookieStores() -> [{ id, tabIds: storeTabIds(id) }].
+// - onChanged: {removed, cookie, cause} after each change, like Chrome: a set
+//   over an existing cookie reports the old one removed ('overwrite') then the
+//   new one ('explicit'); remove() reports each deleted cookie ('explicit');
+//   an already-expired set reports the deleted one ('expired_overwrite').
 //
-// Test helpers: dump() returns every live cookie, calls logs every call,
-// latency (ms) delays each response (0 = next macrotask).
+// Test helpers: dump(storeId = '0') returns every live cookie of that store,
+// calls logs every call, latency (ms) delays each response (0 = next macrotask).
 
 const SET_KEYS = new Set([
   'url', 'name', 'value', 'domain', 'path', 'secure', 'httpOnly', 'sameSite',
@@ -130,14 +140,38 @@ function partitionFilterMatches(filterPk, cookie) {
     || cookie.partitionKey.hasCrossSiteAncestor === filterPk.hasCrossSiteAncestor;
 }
 
+export const REGULAR = '0';
+
+function createEvent() {
+  const listeners = new Set();
+  return {
+    addListener: (fn) => { listeners.add(fn); },
+    removeListener: (fn) => { listeners.delete(fn); },
+    hasListener: (fn) => listeners.has(fn),
+    fire: (...args) => { for (const fn of [...listeners]) fn(...args); },
+    reset: () => { listeners.clear(); },
+    get size() { return listeners.size; },
+  };
+}
+
 export function createFakeCookies({
   now = () => Date.now(),
   latency = 0,
   invalidSet = 'reject',
+  stores = [REGULAR],
+  storeTabIds = () => [],
 } = {}) {
-  /** @type {Map<string, object>} */
-  const jar = new Map();
-  const calls = { getAll: [], set: [], remove: [] };
+  /** @type {Map<string, Map<string, object>>} storeId -> (key -> cookie) */
+  const jars = new Map(stores.map((id) => [id, new Map()]));
+  const calls = { getAll: [], set: [], remove: [], getAllCookieStores: 0 };
+  const onChanged = createEvent();
+  const changed = (removed, cookie, cause) => onChanged.fire({ removed, cookie: structuredClone(cookie), cause });
+
+  function jarOf(storeId = REGULAR) {
+    const jar = jars.get(storeId);
+    if (!jar) throw new Error(`Invalid cookie store id: "${storeId}".`);
+    return jar;
+  }
 
   const respond = (fn) => new Promise((resolve, reject) => {
     setTimeout(() => {
@@ -152,13 +186,14 @@ export function createFakeCookies({
   const isExpired = (c) => !c.session && c.expirationDate <= now() / 1000;
 
   function purgeExpired() {
-    for (const [k, c] of jar) if (isExpired(c)) jar.delete(k);
+    for (const jar of jars.values()) for (const [k, c] of jar) if (isExpired(c)) jar.delete(k);
   }
 
   function getAll(details = {}) {
     validateKeys('getAll', details, GET_ALL_KEYS);
     calls.getAll.push(structuredClone(details));
     return respond(() => {
+      const jar = jarOf(details.storeId);
       purgeExpired();
       let url = null;
       if (details.url !== undefined) url = new URL(details.url);
@@ -182,6 +217,8 @@ export function createFakeCookies({
     validateKeys('set', details, SET_KEYS);
     calls.set.push(structuredClone(details));
     return respond(() => {
+      const jar = jarOf(details.storeId);
+      const storeId = details.storeId ?? REGULAR;
       const name = details.name ?? '';
       const fail = (why) => {
         if (invalidSet === 'null') return null;
@@ -248,7 +285,7 @@ export function createFakeCookies({
         sameSite,
         secure,
         session,
-        storeId: '0',
+        storeId,
         value: details.value ?? '',
       };
       if (!session) cookie.expirationDate = details.expirationDate;
@@ -259,12 +296,16 @@ export function createFakeCookies({
       }
 
       const key = keyOf(cookie);
+      const old = jar.get(key);
       if (isExpired(cookie)) {
         // Chrome deletes the existing cookie and stores nothing; set() resolves undefined.
         jar.delete(key);
+        if (old) changed(true, old, 'expired_overwrite');
         return undefined;
       }
       jar.set(key, cookie);
+      if (old) changed(true, old, 'overwrite');
+      changed(false, cookie, 'explicit');
       return structuredClone(cookie);
     });
   }
@@ -273,6 +314,7 @@ export function createFakeCookies({
     validateKeys('remove', details, REMOVE_KEYS);
     calls.remove.push(structuredClone(details));
     return respond(() => {
+      const jar = jarOf(details.storeId);
       const url = new URL(details.url);
       const filterPartition = partitionId(details.partitionKey);
       purgeExpired();
@@ -283,22 +325,39 @@ export function createFakeCookies({
         if (!pathMatches(url.pathname, c.path)) continue;
         if (c.secure && url.protocol !== 'https:') continue;
         jar.delete(k);
+        changed(true, c, 'explicit');
       }
-      const result = { name: details.name, storeId: '0', url: details.url };
+      const result = { name: details.name, storeId: details.storeId ?? REGULAR, url: details.url };
       if (details.partitionKey) result.partitionKey = structuredClone(details.partitionKey);
       return result;
     });
+  }
+
+  function getAllCookieStores() {
+    calls.getAllCookieStores += 1;
+    return respond(() => [...jars.keys()].map((id) => ({ id, tabIds: [...storeTabIds(id)] })));
   }
 
   return {
     getAll,
     set,
     remove,
+    getAllCookieStores,
+    onChanged,
     calls,
-    /** Every live cookie (cloned), regardless of partition. */
-    dump() {
+    /** Creates a cookie store (no-op if it exists), e.g. the Incognito profile's '1'. */
+    addStore(id) {
+      if (!jars.has(id)) jars.set(id, new Map());
+    },
+    /** Drops a store and its cookies without events (the last Incognito window closed). */
+    removeStore(id) {
+      jars.delete(id);
+    },
+    hasStore: (id) => jars.has(id),
+    /** Every live cookie (cloned) of one store, regardless of partition. */
+    dump(storeId = REGULAR) {
       purgeExpired();
-      return [...jar.values()].map((c) => structuredClone(c));
+      return [...(jars.get(storeId)?.values() ?? [])].map((c) => structuredClone(c));
     },
   };
 }

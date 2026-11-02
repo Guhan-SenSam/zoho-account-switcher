@@ -6,6 +6,7 @@ import {
   ZOHO_HOST_PATTERNS,
   KNOWN_SUBDOMAINS,
   SIGN_IN_URL,
+  REGULAR_STORE_ID,
   isZohoHost,
   isZohoUrl,
   isZohoCookieDomain,
@@ -28,6 +29,10 @@ describe('zoho-domains constants', () => {
       'accounts', 'mail', 'mailadmin', 'admin', 'vault', 'workplace', 'crm', 'desk',
       'projects', 'cliq', 'calendar', 'workdrive', 'people', 'books', 'one', 'www',
     ]);
+  });
+
+  test('REGULAR_STORE_ID is the regular profile\'s cookie store', () => {
+    assert.equal(REGULAR_STORE_ID, '0');
   });
 
   test('SIGN_IN_URL', () => {

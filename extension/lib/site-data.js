@@ -29,8 +29,12 @@ export function createSiteData(
   { tabs, scripting, browsingData } = globalThis.chrome ?? {},
   { reloadWaitMs = RELOAD_WAIT_MS } = {},
 ) {
+  // Regular-profile tabs only: with "incognito": "spanning" tabs.query also
+  // returns Incognito tabs, which belong to the private add flow, not to the
+  // active account (so resetTabs and deepClean never touch them).
   async function listZohoTabs() {
-    return tabs.query({ url: [...ZOHO_HOST_PATTERNS] });
+    const found = await tabs.query({ url: [...ZOHO_HOST_PATTERNS] });
+    return (found ?? []).filter((tab) => !tab?.incognito);
   }
 
   // Settles each tab once the load started by our reload reports 'complete',

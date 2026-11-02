@@ -2,8 +2,14 @@
 //
 // Talks to the background service worker only through
 // chrome.runtime.sendMessage({ type, ...args }). Every response carries the full
-// `state` ({ accounts, activeId, pending, settings, busy }) and the popup simply
-// re-renders from it. User-provided text is only ever inserted via text nodes.
+// `state` ({ accounts, activeId, pending, settings, busy, incognitoAllowed }) and
+// the popup simply re-renders from it. User-provided text is only ever inserted
+// via text nodes.
+//
+// `state.pending` (an add in progress) is { previousId, startedAt, mode,
+// windowOpen, captured }. mode 'private' = signing in to the new account in an
+// Incognito window while this session stays signed in; 'signout' (or no mode,
+// from older data) = the browser was signed out of Zoho for the new sign-in.
 
 const NAME_ERROR = 'Name must be 1–40 characters';
 /** Same rule as the store (lib/accounts.js): 1–40 Unicode code points after trim. */
@@ -25,7 +31,33 @@ const BUSY_LABELS = {
   rename: 'Saving…',
   remove: 'Removing…',
   setSettings: 'Saving…',
+  openIncognitoSettings: 'Opening settings…',
 };
+
+/** 'private' | 'signout' for a pending add (data from before private mode has no `mode`). */
+function pendingMode(pending) {
+  return pending?.mode === 'private' ? 'private' : 'signout';
+}
+
+/**
+ * Private add whose window was closed before a sign-in was captured: Save can't
+ * work yet, so reopening the window is the one thing to do.
+ */
+function needsReopen(pending) {
+  return Boolean(pending) && pendingMode(pending) === 'private' && !pending.windowOpen && !pending.captured;
+}
+
+function busyLabelFor(msg) {
+  if (msg.type === 'beginAdd') {
+    const pending = ui.state?.pending;
+    if (pending) {
+      if (pendingMode(pending) === 'signout') return BUSY_LABELS.beginAdd;
+      return pending.windowOpen ? 'Showing window…' : 'Opening private window…';
+    }
+    if (ui.state?.incognitoAllowed === true) return 'Opening private window…';
+  }
+  return BUSY_LABELS[msg.type] || 'Working…';
+}
 
 const ui = {
   /** Last state received from the background, or null before the first load. */
@@ -40,7 +72,7 @@ const ui = {
   /** null | 'menu' | 'rename' | 'confirm' (remove) | 'confirm-switch' */
   rowMode: null,
   drafts: { pending: '', saveCurrent: '', rename: '' },
-  /** null | { kind: 'error' | 'warning', lines: string[] } */
+  /** null | { kind: 'error' | 'warning' | 'info', lines: string[] } */
   message: null,
   /** Focus to restore after the next render (captured before controls get disabled). */
   savedFocus: null,
@@ -54,6 +86,8 @@ const els = {
   addLabel: document.querySelector('#add-account .btn-label'),
   addIcon: document.querySelector('#add-account .btn-icon'),
   deepClean: document.getElementById('deep-clean'),
+  incognitoHint: document.getElementById('incognito-hint'),
+  incognitoSettings: document.getElementById('incognito-settings'),
   messageBox: document.getElementById('message-box'),
   message: document.getElementById('message'),
   messageDismiss: document.getElementById('message-dismiss'),
@@ -84,7 +118,7 @@ async function sendRaw(msg) {
  * @param {object} msg       protocol request
  * @param {object} [opts]
  * @param {(res: object) => void} [opts.onOk]  adjust UI-local state on success
- * @param {object} [opts.focus]                focus target after success
+ * @param {object | ((res: object) => object | null)} [opts.focus]  focus target after success
  */
 async function request(msg, { onOk, focus } = {}) {
   if (isBusy()) return null;
@@ -92,7 +126,7 @@ async function request(msg, { onOk, focus } = {}) {
   ui.savedFocus = focusKeyOf(document.activeElement);
   ui.message = null;
   ui.inFlight += 1;
-  ui.busyLabel = BUSY_LABELS[msg.type] || 'Working…';
+  ui.busyLabel = busyLabelFor(msg);
   ui.op = msg;
   render();
 
@@ -104,9 +138,12 @@ async function request(msg, { onOk, focus } = {}) {
   let focusTarget = null;
   if (res.ok) {
     onOk?.(res);
-    focusTarget = focus ?? null;
+    focusTarget = (typeof focus === 'function' ? focus(res) : focus) ?? null;
     const warnings = Array.isArray(res.warnings) ? res.warnings.filter(Boolean).map(String) : [];
-    if (warnings.length) ui.message = { kind: 'warning', lines: warnings };
+    // e.g. finishAdd in private mode: 'Saved “Work”. Click it to switch.'
+    const notice = typeof res.notice === 'string' && res.notice.trim() ? res.notice : null;
+    if (warnings.length) ui.message = { kind: 'warning', lines: notice ? [notice, ...warnings] : warnings };
+    else if (notice) ui.message = { kind: 'info', lines: [notice] };
   } else {
     ui.message = { kind: 'error', lines: [String(res.error || 'Something went wrong.')] };
   }
@@ -248,7 +285,8 @@ function onAddAccount() {
   const wasPending = Boolean(ui.state?.pending);
   closeRow();
   request({ type: 'beginAdd' }, {
-    // When already pending this only re-opens the sign-in tab; keep the typed name.
+    // When already pending this only re-opens the sign-in tab (or shows / reopens
+    // the private window); keep the typed name.
     onOk: () => { if (!wasPending) ui.drafts.pending = ''; },
     focus: { testid: 'new-account-name' },
   });
@@ -257,9 +295,20 @@ function onAddAccount() {
 function onFinishAdd() {
   const name = validName(ui.drafts.pending);
   if (!name) return showError(NAME_ERROR, { testid: 'new-account-name' });
+  const known = new Set((ui.state?.accounts ?? []).map((a) => a.id));
   request({ type: 'finishAdd', name }, {
     onOk: () => { ui.drafts.pending = ''; },
+    // Private mode saves the account without switching to it ("Click it to
+    // switch"): put focus on its row so Enter switches.
+    focus: (res) => {
+      const added = res.state?.accounts?.find((a) => !known.has(a.id));
+      return added && added.id !== res.state.activeId ? { testid: 'switch', id: added.id } : null;
+    },
   });
+}
+
+function onOpenIncognitoSettings() {
+  request({ type: 'openIncognitoSettings' }, { focus: { testid: 'incognito-settings' } });
 }
 
 function onCancelAdd() {
@@ -349,7 +398,7 @@ function timeAgo(ts) {
   if (abs < 3600) return relTime.format(Math.round(seconds / 60), 'minute');
   if (abs < 86400) return relTime.format(Math.round(seconds / 3600), 'hour');
   if (abs < 86400 * 30) return relTime.format(Math.round(seconds / 86400), 'day');
-  // 'always' avoids "Last used last month".
+  // 'always' avoids "Saved last month".
   if (abs < 86400 * 365) return relTimeNumeric.format(Math.round(seconds / (86400 * 30)), 'month');
   return relTimeNumeric.format(Math.round(seconds / (86400 * 365)), 'year');
 }
@@ -429,7 +478,29 @@ function render({ focus = null } = {}) {
 }
 
 function renderPending(state, accounts) {
-  const previous = accounts.find((a) => a.id === state.pending?.previousId) ?? null;
+  const pending = state.pending;
+  const mode = pendingMode(pending);
+  const previous = accounts.find((a) => a.id === pending?.previousId) ?? null;
+
+  let intro;
+  let status = null;
+  let note;
+  if (mode === 'private') {
+    intro = 'Sign in to the new Zoho account in the private window. You stay signed in here.';
+    if (!pending.windowOpen) {
+      status = h('p', { class: `callout ${pending.captured ? 'callout-ok' : 'callout-warn'}`, testid: 'private-window-closed' },
+        h('strong', null, 'The private window was closed.'), ' ',
+        pending.captured ? 'Your sign-in was saved — name it and click Save.' : 'Reopen it to sign in.');
+    }
+    if (pending.windowOpen) note = 'Cancel closes the private window.';
+    else note = pending.captured ? 'Cancel discards this sign-in.' : 'Cancel stops adding this account.';
+  } else {
+    intro = 'Sign in to Zoho in the tab that just opened, then name this account.';
+    note = previous
+      ? ['Cancel signs you back in as ', h('strong', null, previous.name), '.']
+      : 'Cancel discards this sign-in.';
+  }
+
   const input = h('input', {
     type: 'text',
     id: 'new-account-name',
@@ -442,9 +513,15 @@ function renderPending(state, accounts) {
     value: ui.drafts.pending,
     oninput: (e) => { ui.drafts.pending = e.target.value; },
   });
-  return h('section', { class: 'panel panel-accent', testid: 'pending-panel', 'aria-labelledby': 'pending-title' },
+  return h('section', {
+    class: 'panel panel-accent',
+    testid: 'pending-panel',
+    dataset: { mode },
+    'aria-labelledby': 'pending-title',
+  },
     h('h2', { class: 'panel-title', id: 'pending-title' }, 'Adding an account'),
-    h('p', { class: 'panel-text' }, 'Sign in to Zoho in the tab that just opened, then name this account.'),
+    h('p', { class: 'panel-text' }, intro),
+    status,
     h('form', {
       class: 'stack',
       novalidate: true,
@@ -454,13 +531,10 @@ function renderPending(state, accounts) {
       input,
       h('div', { class: 'actions' },
         h('button', { type: 'button', class: 'btn', testid: 'cancel-add', onclick: onCancelAdd }, 'Cancel'),
-        h('button', { type: 'submit', class: 'btn btn-primary', testid: 'finish-add' }, 'Save account'),
+        h('button', { type: 'submit', class: `btn${needsReopen(pending) ? '' : ' btn-primary'}`, testid: 'finish-add' }, 'Save account'),
       ),
     ),
-    h('p', { class: 'panel-note' },
-      previous
-        ? ['Cancel signs you back in as ', h('strong', null, previous.name), '.']
-        : 'Cancel discards this sign-in.'),
+    h('p', { class: 'panel-note' }, note),
   );
 }
 
@@ -533,7 +607,7 @@ function renderAccount(account, active) {
   if (switching) sub = 'Switching…';
   else if (account.cookieCount === 0) sub = 'No saved sign-in';
   else if (active) sub = 'Current session';
-  else sub = account.savedAt ? `Last used ${timeAgo(account.savedAt)}` : 'Saved';
+  else sub = account.savedAt ? `Saved ${timeAgo(account.savedAt)}` : 'Saved';
 
   const actionsId = `actions-${account.id}`;
   li.append(h('div', { class: 'row' },
@@ -630,11 +704,25 @@ function renderRenameForm(account) {
 function renderFooter(state, accounts) {
   els.footer.hidden = false;
   const pending = Boolean(state.pending);
-  // While an add is pending, beginAdd just re-opens the sign-in tab.
-  els.addLabel.textContent = pending ? 'Reopen sign-in page' : 'Add account';
+  // While an add is pending, beginAdd just re-opens the sign-in tab, or shows /
+  // reopens the private window.
+  let label = 'Add account';
+  if (pending && pendingMode(state.pending) === 'private') {
+    label = state.pending.windowOpen ? 'Show private window' : 'Reopen private window';
+  } else if (pending) {
+    label = 'Reopen sign-in page';
+  }
+  els.addLabel.textContent = label;
   els.addIcon.textContent = pending ? '↗' : '+';
-  els.addAccount.classList.toggle('btn-primary', !pending && accounts.length === 0);
+  els.addAccount.classList.toggle('btn-primary', (!pending && accounts.length === 0) || needsReopen(state.pending));
   els.addAccount.classList.toggle('btn-dashed', !pending && accounts.length > 0);
+
+  // Only when the background says so explicitly (older data has no flag).
+  const hint = !pending && state.incognitoAllowed === false;
+  els.incognitoHint.hidden = !hint;
+  if (hint) els.addAccount.setAttribute('aria-describedby', 'incognito-hint-text');
+  else els.addAccount.removeAttribute('aria-describedby');
+
   els.deepClean.checked = Boolean(state.settings?.deepClean);
 }
 
@@ -642,6 +730,8 @@ function renderMessage() {
   const msg = ui.message;
   els.messageBox.hidden = !msg;
   els.messageBox.className = `message${msg ? ` message-${msg.kind}` : ''}`;
+  if (msg) els.message.dataset.kind = msg.kind;
+  else delete els.message.dataset.kind;
   els.message.setAttribute('role', msg?.kind === 'error' ? 'alert' : 'status');
   const lines = msg ? msg.lines.map((line) => h('span', { class: 'message-line' }, line)) : [];
   els.message.replaceChildren(...lines);
@@ -671,6 +761,7 @@ function schedulePoll() {
 // Global listeners
 
 els.addAccount.addEventListener('click', onAddAccount);
+els.incognitoSettings.addEventListener('click', onOpenIncognitoSettings);
 els.deepClean.addEventListener('change', onDeepCleanChange);
 els.messageDismiss.addEventListener('click', () => {
   ui.message = null;

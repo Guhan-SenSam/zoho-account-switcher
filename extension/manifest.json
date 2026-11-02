@@ -4,7 +4,7 @@
   "version": "1.0.0",
   "description": "Keep several Zoho accounts in one Chrome profile and switch between them in a click.",
   "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAp9z0d/uTD7ULz+drLZBDz1TzaBam/w5+dt3MNx2OcAhLxK6Y7BrtLrzeUggqFnqdPRw5g51XQX+m9nMS16XmYQWxr4HldpVtb3n6mECr4ALdTyIguszDo9TTwOMsUjVJIdSA6q2pgt7Zp39SCyCf3pHFs2LsD9XiOcwvXCqrmjceSeWyGSjQIUauhmFSo0AzxBK+hopfm6KTlJ+qXm78/Ikzru+JaKEDOBGNfaJ1n2AsShQXOp+Bu6orQW1Mry6fUE76nC8zdd/aFJi+X5OBtxNmFYmJPhbElczTw0A4aNgCXZZG1i0b5xWhGP5+yF7iKUiF9YfYItQQr3s1LIYgdwIDAQAB",
-  "incognito": "not_allowed",
+  "incognito": "spanning",
   "permissions": ["cookies", "storage", "scripting", "browsingData"],
   "host_permissions": [
     "*://*.zoho.com/*",

@@ -7,9 +7,16 @@
 //   order:    string[]
 //   activeId: string | null
 //   settings: { deepClean: boolean }
-//   pending:  null | { previousId: string|null, startedAt: number, previousCookies?: SavedCookie[] }
-//             previousCookies: the unsaved session that was live when an add
-//             began with no active account (cancelAdd puts it back)
+//   pending:  null | "add account" in progress, one of
+//             sign-out mode (also any pending without `mode`, i.e. old data):
+//               { mode?: 'signout', previousId: string|null, startedAt: number, previousCookies?: SavedCookie[] }
+//               previousCookies: the unsaved session that was live when an add
+//               began with no active account (cancelAdd puts it back)
+//             private mode (signing in in an Incognito window):
+//               { mode: 'private', previousId: string|null, startedAt: number,
+//                 windowId: number|null, storeId: string, capturedCookies?: SavedCookie[] }
+//               windowId null once that window closed; capturedCookies: the
+//               latest non-empty snapshot of the Incognito store
 //   switching: null | { from: string|null, to: string, startedAt: number }
 //              set while switchTo has cookies in flux; survives a crash so the
 //              next service worker can finish the switch (recoverInterruptedSwitch)
@@ -95,17 +102,34 @@ function summary(a) {
   };
 }
 
+const PENDING_SHAPES = 'pending must be null, { mode?: "signout", previousId: string|null, startedAt: number, '
+  + 'previousCookies?: array } or { mode: "private", previousId: string|null, startedAt: number, '
+  + 'windowId: integer|null, storeId: string, capturedCookies?: array }';
+
+const optionalArray = (v) => v === undefined || Array.isArray(v);
+
 function validPending(p) {
   if (p === null) return null;
-  if (!isObject(p)
-    || !(p.previousId === null || typeof p.previousId === 'string')
-    || typeof p.startedAt !== 'number'
-    || (p.previousCookies !== undefined && !Array.isArray(p.previousCookies))) {
-    throw new TypeError(
-      'pending must be null or { previousId: string|null, startedAt: number, previousCookies?: array }',
-    );
+  const common = isObject(p)
+    && (p.previousId === null || typeof p.previousId === 'string')
+    && typeof p.startedAt === 'number';
+  if (common && p.mode === 'private') {
+    if (!(p.windowId === null || Number.isInteger(p.windowId))
+      || typeof p.storeId !== 'string' || p.storeId === ''
+      || !optionalArray(p.capturedCookies)) {
+      throw new TypeError(PENDING_SHAPES);
+    }
+    const pending = {
+      mode: 'private', previousId: p.previousId, startedAt: p.startedAt, windowId: p.windowId, storeId: p.storeId,
+    };
+    if (p.capturedCookies !== undefined) pending.capturedCookies = structuredClone(p.capturedCookies);
+    return pending;
   }
-  const pending = { previousId: p.previousId, startedAt: p.startedAt };
+  if (!common || !(p.mode === undefined || p.mode === 'signout') || !optionalArray(p.previousCookies)) {
+    throw new TypeError(PENDING_SHAPES);
+  }
+  const pending = p.mode === undefined ? {} : { mode: 'signout' };
+  Object.assign(pending, { previousId: p.previousId, startedAt: p.startedAt });
   if (p.previousCookies !== undefined) pending.previousCookies = structuredClone(p.previousCookies);
   return pending;
 }

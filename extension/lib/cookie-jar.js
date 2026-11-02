@@ -90,15 +90,19 @@ export function createCookieJar(api = globalThis.chrome?.cookies, { now = () => 
     return api;
   };
 
-  /** Every live Zoho cookie, partitioned ones included, deduped. */
-  async function snapshot() {
+  // `storeId` given: that cookie store (the private add flow's Incognito store).
+  // Omitted: no storeId is passed, i.e. the background's own (regular) store.
+  const inStore = (details, storeId) => (storeId === undefined ? details : { ...details, storeId });
+
+  /** Every live Zoho cookie of the regular store (or `storeId`), partitioned ones included, deduped. */
+  async function snapshot({ storeId } = {}) {
     const a = cookiesApi();
     const perDomain = await Promise.all(ZOHO_DOMAINS.map(async (domain) => {
       const [plain, all] = await Promise.all([
-        a.getAll({ domain }),
+        a.getAll(inStore({ domain }, storeId)),
         // partitionKey: {} (no topLevelSite) returns partitioned + unpartitioned
         // cookies (Chrome 119+). Older Chrome rejects the property: ignore.
-        attempt(() => a.getAll({ domain, partitionKey: {} })).catch(() => []),
+        attempt(() => a.getAll(inStore({ domain, partitionKey: {} }, storeId))).catch(() => []),
       ]);
       return [...(plain ?? []), ...(all ?? [])];
     }));
@@ -112,26 +116,27 @@ export function createCookieJar(api = globalThis.chrome?.cookies, { now = () => 
     return [...seen.values()];
   }
 
-  function removeDetails(c) {
-    const details = { url: cookieUrl(c), name: c.name };
+  function removeDetails(c, storeId) {
+    const details = inStore({ url: cookieUrl(c), name: c.name }, storeId);
     if (c.partitionKey) details.partitionKey = { ...c.partitionKey };
     return details;
   }
 
   /**
-   * Remove every Zoho cookie. chrome.cookies.remove({url, name}) deletes every
-   * same-name cookie sent to that URL, and pages may set cookies while we work,
-   * so re-snapshot and repeat until nothing is left (max 3 passes).
+   * Remove every Zoho cookie of the regular store (or `storeId`).
+   * chrome.cookies.remove({url, name}) deletes every same-name cookie sent to
+   * that URL, and pages may set cookies while we work, so re-snapshot and
+   * repeat until nothing is left (max 3 passes).
    * Returns the number of distinct cookies removed (survivors not counted).
    */
-  async function clear() {
+  async function clear({ storeId } = {}) {
     const a = cookiesApi();
     const removed = new Map();
-    let live = await snapshot();
+    let live = await snapshot({ storeId });
     for (let pass = 0; pass < MAX_CLEAR_PASSES && live.length > 0; pass += 1) {
       for (const c of live) removed.set(cookieKey(c), c);
-      await Promise.allSettled(live.map((c) => attempt(() => a.remove(removeDetails(c)))));
-      live = await snapshot();
+      await Promise.allSettled(live.map((c) => attempt(() => a.remove(removeDetails(c, storeId)))));
+      live = await snapshot({ storeId });
     }
     for (const c of live) removed.delete(cookieKey(c));
     return removed.size;
@@ -148,7 +153,8 @@ export function createCookieJar(api = globalThis.chrome?.cookies, { now = () => 
   }
 
   /**
-   * Set saved cookies back: all in parallel, then each failure retried once,
+   * Set saved cookies back into the regular store (never another one): all in
+   * parallel, then each failure retried once,
    * one at a time. Expired persistent cookies are skipped; with `onlyMissing`
    * so are cookies already live (same name|domain|path|partitionKey), so newer
    * live values are never overwritten. A set() that rejects, throws, or

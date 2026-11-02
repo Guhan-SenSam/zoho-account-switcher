@@ -176,6 +176,74 @@ describe('fake chrome.cookies models Chrome semantics', () => {
   });
 });
 
+describe('fake chrome.cookies: cookie stores and change events', () => {
+  test('stores are independent; no storeId means the regular store "0"; results carry their storeId', async () => {
+    const fake = createFakeCookies({ now, stores: ['0', '1'] });
+    const regular = await fake.set({ url: 'https://zoho.com/', name: 'a', value: 'regular' });
+    const incog = await fake.set({ url: 'https://zoho.com/', name: 'a', value: 'incognito', storeId: '1' });
+    assert.equal(regular.storeId, '0');
+    assert.equal(incog.storeId, '1');
+    assert.deepEqual((await fake.getAll({ domain: 'zoho.com' })).map((c) => c.value), ['regular']);
+    assert.deepEqual((await fake.getAll({ domain: 'zoho.com', storeId: '0' })).map((c) => c.value), ['regular']);
+    assert.deepEqual((await fake.getAll({ domain: 'zoho.com', storeId: '1' })).map((c) => c.value), ['incognito']);
+    assert.deepEqual((await fake.getAll({ domain: 'zoho.com', storeId: '1', partitionKey: {} })).map((c) => c.storeId), ['1']);
+
+    const removed = await fake.remove({ url: 'https://zoho.com/', name: 'a', storeId: '1' });
+    assert.equal(removed.storeId, '1');
+    assert.deepEqual(fake.dump('1'), []);
+    assert.deepEqual(fake.dump().map((c) => c.value), ['regular'], 'dump() is the regular store');
+    await fake.remove({ url: 'https://zoho.com/', name: 'a' });
+    assert.deepEqual(fake.dump(), []);
+  });
+
+  test('an unknown storeId rejects like Chrome', async () => {
+    const fake = createFakeCookies({ now });
+    await assert.rejects(fake.getAll({ storeId: '1' }), /Invalid cookie store id: "1"/);
+    await assert.rejects(fake.set({ url: 'https://zoho.com/', name: 'a', storeId: '1' }), /Invalid cookie store id/);
+    await assert.rejects(fake.remove({ url: 'https://zoho.com/', name: 'a', storeId: '1' }), /Invalid cookie store id/);
+  });
+
+  test('getAllCookieStores lists each store with its tab ids; addStore/removeStore model the Incognito profile', async () => {
+    const tabs = { 0: [1, 2], 1: [9] };
+    const fake = createFakeCookies({ now, storeTabIds: (id) => tabs[id] ?? [] });
+    assert.deepEqual(await fake.getAllCookieStores(), [{ id: '0', tabIds: [1, 2] }]);
+    fake.addStore('1');
+    fake.addStore('1');
+    await fake.set({ url: 'https://zoho.com/', name: 'a', value: '1', storeId: '1' });
+    assert.deepEqual(await fake.getAllCookieStores(), [{ id: '0', tabIds: [1, 2] }, { id: '1', tabIds: [9] }]);
+    fake.removeStore('1'); // last Incognito window closed: the profile and its cookies are gone
+    assert.deepEqual(await fake.getAllCookieStores(), [{ id: '0', tabIds: [1, 2] }]);
+    await assert.rejects(fake.getAll({ storeId: '1' }), /Invalid cookie store id/);
+    fake.addStore('1');
+    assert.deepEqual(await fake.getAll({ storeId: '1' }), [], 'a new Incognito profile starts empty');
+  });
+
+  test('onChanged reports sets, overwrites and removals with the cookie\'s storeId', async () => {
+    const fake = createFakeCookies({ now, stores: ['0', '1'] });
+    const events = [];
+    const listener = (e) => events.push([e.removed, e.cause, e.cookie.name, e.cookie.value, e.cookie.storeId]);
+    fake.onChanged.addListener(listener);
+    assert.equal(fake.onChanged.hasListener(listener), true);
+    await fake.set({ url: 'https://zoho.com/', name: 'a', value: '1' });
+    await fake.set({ url: 'https://zoho.com/', name: 'a', value: '2' });
+    await fake.set({ url: 'https://zoho.com/', name: 'b', value: 'x', storeId: '1' });
+    await fake.remove({ url: 'https://zoho.com/', name: 'b', storeId: '1' });
+    await fake.set({ url: 'https://zoho.com/', name: 'a', value: '3', expirationDate: NOW_S - 1 });
+    await fake.remove({ url: 'https://zoho.com/', name: 'nothing' });
+    assert.deepEqual(events, [
+      [false, 'explicit', 'a', '1', '0'],
+      [true, 'overwrite', 'a', '1', '0'],
+      [false, 'explicit', 'a', '2', '0'],
+      [false, 'explicit', 'b', 'x', '1'],
+      [true, 'explicit', 'b', 'x', '1'],
+      [true, 'expired_overwrite', 'a', '2', '0'],
+    ]);
+    fake.onChanged.removeListener(listener);
+    await fake.set({ url: 'https://zoho.com/', name: 'c', value: '1' });
+    assert.equal(events.length, 6);
+  });
+});
+
 describe('toSavedCookie', () => {
   test('drops storeId and keeps exactly the SavedCookie fields', () => {
     const chromeCookie = {
@@ -660,6 +728,79 @@ describe('createCookieJar', () => {
         { ...base, name: 'new', expirationDate: Date.now() / 1000 + 3600 },
       ]);
       assert.deepEqual(r, { restored: 1, skipped: 1, failed: [] });
+    });
+  });
+
+  describe('cookie stores (Incognito spanning)', () => {
+    const INCOGNITO = '1';
+
+    /** Realistic Zoho jar in the regular store, a different signed-in user in the Incognito one. */
+    async function twoStores() {
+      const fake = createFakeCookies({ now, stores: ['0', INCOGNITO] });
+      await seedRealistic(fake);
+      await fake.set({ url: 'https://accounts.zoho.com/', domain: '.zoho.com', name: 'IAMAUTHTOKEN', value: 'incognito-auth', path: '/', secure: true, httpOnly: true, sameSite: 'no_restriction', expirationDate: FUTURE, storeId: INCOGNITO });
+      await fake.set({ url: 'https://mail.zoho.eu/', name: 'zmsess', value: 'incognito-mail', path: '/', secure: true, storeId: INCOGNITO });
+      await fake.set({ url: 'https://www.google.com/', name: 'NID', value: 'incognito-g', path: '/', secure: true, storeId: INCOGNITO });
+      return fake;
+    }
+
+    test('snapshot() without a storeId reads the regular store only and never passes storeId', async () => {
+      const fake = await twoStores();
+      const snap = await createCookieJar(fake, { now }).snapshot();
+      assert.deepEqual(snap.map((c) => c.name).sort(), [...zohoNames].sort());
+      assert.equal(snap.some((c) => c.value.startsWith('incognito')), false);
+      assert.equal(fake.calls.getAll.some((d) => 'storeId' in d), false);
+    });
+
+    test('snapshot({ storeId }) reads only that store, on every getAll call', async () => {
+      const fake = await twoStores();
+      const snap = await createCookieJar(fake, { now }).snapshot({ storeId: INCOGNITO });
+      assert.deepEqual(snap.map((c) => `${c.name}=${c.value}`).sort(), ['IAMAUTHTOKEN=incognito-auth', 'zmsess=incognito-mail']);
+      for (const c of snap) assert.equal('storeId' in c, false);
+      assert.equal(fake.calls.getAll.length, ZOHO_DOMAINS.length * 2);
+      assert.ok(fake.calls.getAll.every((d) => d.storeId === INCOGNITO));
+    });
+
+    test('clear({ storeId }) removes that store\'s Zoho cookies only; the regular jar is untouched', async () => {
+      const fake = await twoStores();
+      const regularBefore = fake.dump();
+      const n = await createCookieJar(fake, { now }).clear({ storeId: INCOGNITO });
+      assert.equal(n, 2);
+      assert.deepEqual(fake.dump(INCOGNITO).map((c) => c.name), ['NID'], 'non-Zoho Incognito cookies stay');
+      assert.deepEqual(fake.dump(), regularBefore);
+      assert.ok(fake.calls.remove.length > 0);
+      assert.ok(fake.calls.remove.every((d) => d.storeId === INCOGNITO));
+    });
+
+    test('clear() without a storeId never touches the Incognito store', async () => {
+      const fake = await twoStores();
+      const incognitoBefore = fake.dump(INCOGNITO);
+      await createCookieJar(fake, { now }).clear();
+      assert.deepEqual(fake.dump().map((c) => c.name).sort(), ['IAMAUTHTOKEN', 'NID'].sort(), 'only non-Zoho regular cookies left');
+      assert.equal(fake.dump().find((c) => c.name === 'IAMAUTHTOKEN').value, 'evil');
+      assert.deepEqual(fake.dump(INCOGNITO), incognitoBefore);
+      assert.equal(fake.calls.remove.some((d) => 'storeId' in d), false);
+    });
+
+    test('restore() writes the regular store only', async () => {
+      const fake = await twoStores();
+      const jar = createCookieJar(fake, { now });
+      const incognitoBefore = fake.dump(INCOGNITO);
+      const saved = await jar.snapshot({ storeId: INCOGNITO });
+      await jar.clear();
+      const setsBefore = fake.calls.set.length;
+      await jar.restore(saved, { onlyMissing: true });
+      assert.deepEqual(fake.dump(INCOGNITO), incognitoBefore);
+      assert.deepEqual(fake.dump().filter((c) => c.value.startsWith('incognito')).map((c) => c.storeId), ['0', '0']);
+      assert.equal(fake.calls.set.slice(setsBefore).some((d) => 'storeId' in d), false);
+    });
+
+    test('a store that no longer exists rejects (the caller decides what that means)', async () => {
+      const fake = await twoStores();
+      fake.removeStore(INCOGNITO);
+      const jar = createCookieJar(fake, { now });
+      await assert.rejects(jar.snapshot({ storeId: INCOGNITO }), /Invalid cookie store id/);
+      await assert.rejects(jar.clear({ storeId: INCOGNITO }), /Invalid cookie store id/);
     });
   });
 });

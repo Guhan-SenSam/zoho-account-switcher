@@ -1,11 +1,13 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { createRouter, createCookieSyncScheduler, SYNC_DEBOUNCE_MS, SYNC_MAX_WAIT_MS } from '../../extension/lib/router.js';
+import {
+  createRouter, createCookieSyncScheduler, createCookieChangeRouter, SYNC_DEBOUNCE_MS, SYNC_MAX_WAIT_MS, CAPTURE_DEBOUNCE_MS,
+} from '../../extension/lib/router.js';
 
 const EXT = 'chrome-extension://abcdefghijklmnop/';
 const popup = { id: 'abcdefghijklmnop', url: `${EXT}popup/popup.html` };
 
-function setup() {
+function setup({ privateWindows: withPrivateWindows = true } = {}) {
   const calls = [];
   const state = {
     accounts: { A: { id: 'A', name: 'Alpha' } },
@@ -16,6 +18,7 @@ function setup() {
   };
   const store = {
     async getState() { return structuredClone(state); },
+    async getPending() { return structuredClone(state.pending); },
     async list() { return state.order.map((id) => ({ id, name: state.accounts[id].name, color: '#000', initials: 'AL', cookieCount: 0 })); },
     async rename(id, name) {
       calls.push(['store.rename', id, name]);
@@ -39,15 +42,27 @@ function setup() {
       state.activeId = id;
       return { warnings: ['1 cookie could not be restored'] };
     },
-    async beginAdd() { calls.push(['beginAdd']); state.pending = { previousId: 'A', startedAt: 1 }; return { warnings: [] }; },
-    async finishAdd(name) { calls.push(['finishAdd', name]); state.pending = null; return { id: 'C', name }; },
+    async beginAdd() { calls.push(['beginAdd']); state.pending = { mode: 'signout', previousId: 'A', startedAt: 1 }; return { warnings: [], mode: 'signout' }; },
+    async finishAdd(name) {
+      calls.push(['finishAdd', name]);
+      if (!state.pending) throw new Error('No account is being added');
+      state.pending = null;
+      return { id: 'C', name: String(name).trim(), cookies: [{ name: 'IAM', value: 'secret' }] };
+    },
     async cancelAdd() { calls.push(['cancelAdd']); state.pending = null; return { warnings: ['x'] }; },
     async saveCurrentAs(name) { calls.push(['saveCurrentAs', name]); return { id: 'C', name }; },
     async remove(id) { calls.push(['remove', id]); },
     async refreshBadge() { calls.push(['refreshBadge']); },
   };
-  const router = createRouter({ switcher, store, extensionUrl: EXT });
-  return { router, switcher, store, state, calls };
+  const privateWindows = {
+    allowed: true,
+    openWindows: new Set(),
+    async isAllowed() { if (this.allowed instanceof Error) throw this.allowed; return this.allowed; },
+    async isOpen(id) { return this.openWindows.has(id); },
+    async openSettings() { calls.push(['openSettings']); },
+  };
+  const router = createRouter({ switcher, store, extensionUrl: EXT, ...(withPrivateWindows ? { privateWindows } : {}) });
+  return { router, switcher, store, state, calls, privateWindows };
 }
 
 test('getState returns the full state shape', async () => {
@@ -61,6 +76,7 @@ test('getState returns the full state shape', async () => {
       pending: null,
       settings: { deepClean: false },
       busy: false,
+      incognitoAllowed: true,
     },
   });
 });
@@ -69,7 +85,55 @@ test('state.pending never carries the stashed session cookies', async () => {
   const { router, state } = setup();
   state.pending = { previousId: null, startedAt: 5, previousCookies: [{ name: 'IAM', value: 'secret' }] };
   const res = await router.handle({ type: 'getState' }, popup);
-  assert.deepEqual(res.state.pending, { previousId: null, startedAt: 5 });
+  assert.deepEqual(res.state.pending, { previousId: null, startedAt: 5, mode: 'signout', windowOpen: false, captured: false });
+});
+
+test('state.pending for a private add: window open/closed and whether cookies were captured — never cookies or storeId', async () => {
+  const { router, state, privateWindows } = setup();
+  const secret = [{ name: 'IAM', value: 'secret' }];
+  state.pending = { mode: 'private', previousId: 'A', startedAt: 5, windowId: 50, storeId: '1' };
+  privateWindows.openWindows.add(50);
+  let res = await router.handle({ type: 'getState' }, popup);
+  assert.deepEqual(res.state.pending, { previousId: 'A', startedAt: 5, mode: 'private', windowOpen: true, captured: false });
+
+  // Cookies the sign-in page itself sets don't count as a captured sign-in.
+  state.pending.capturedCookies = [{ name: 'iamcsr', value: 'x', domain: 'accounts.zoho.com', hostOnly: true, httpOnly: false }];
+  res = await router.handle({ type: 'getState' }, popup);
+  assert.equal(res.state.pending.captured, false, 'sign-in page cookies alone are not a captured sign-in');
+
+  state.pending.capturedCookies = [{ ...secret[0], domain: '.zoho.com', hostOnly: false, httpOnly: true }];
+  res = await router.handle({ type: 'getState' }, popup);
+  assert.deepEqual(res.state.pending, { previousId: 'A', startedAt: 5, mode: 'private', windowOpen: true, captured: true });
+  assert.doesNotMatch(JSON.stringify(res), /secret|storeId/);
+
+  privateWindows.openWindows.delete(50); // closed, onRemoved not handled yet
+  res = await router.handle({ type: 'getState' }, popup);
+  assert.equal(res.state.pending.windowOpen, false);
+
+  state.pending.windowId = null;
+  state.pending.capturedCookies = [];
+  res = await router.handle({ type: 'getState' }, popup);
+  assert.deepEqual(res.state.pending, { previousId: 'A', startedAt: 5, mode: 'private', windowOpen: false, captured: false });
+});
+
+test('state.pending explicitly marked signout', async () => {
+  const { router, state } = setup();
+  state.pending = { mode: 'signout', previousId: 'A', startedAt: 5 };
+  const res = await router.handle({ type: 'getState' }, popup);
+  assert.deepEqual(res.state.pending, { previousId: 'A', startedAt: 5, mode: 'signout', windowOpen: false, captured: false });
+});
+
+test('state.incognitoAllowed: false when not allowed, when the check fails, or without private windows', async () => {
+  const s1 = setup();
+  s1.privateWindows.allowed = false;
+  assert.equal((await s1.router.handle({ type: 'getState' }, popup)).state.incognitoAllowed, false);
+  const s2 = setup();
+  s2.privateWindows.allowed = new Error('no API');
+  const r2 = await s2.router.handle({ type: 'getState' }, popup);
+  assert.equal(r2.ok, true);
+  assert.equal(r2.state.incognitoAllowed, false);
+  const s3 = setup({ privateWindows: false });
+  assert.equal((await s3.router.handle({ type: 'getState' }, popup)).state.incognitoAllowed, false);
 });
 
 test('state.busy mirrors switcher.isBusy()', async () => {
@@ -115,7 +179,8 @@ test('beginAdd / cancelAdd pass warnings through', async () => {
   const { router, calls } = setup();
   const r1 = await router.handle({ type: 'beginAdd' }, popup);
   assert.equal(r1.ok, true);
-  assert.deepEqual(r1.state.pending, { previousId: 'A', startedAt: 1 });
+  assert.deepEqual(r1.warnings, []);
+  assert.deepEqual(r1.state.pending, { previousId: 'A', startedAt: 1, mode: 'signout', windowOpen: false, captured: false });
   const r2 = await router.handle({ type: 'cancelAdd' }, popup);
   assert.equal(r2.ok, true);
   assert.deepEqual(r2.warnings, ['x']);
@@ -123,11 +188,45 @@ test('beginAdd / cancelAdd pass warnings through', async () => {
 });
 
 test('finishAdd and saveCurrentAs pass the name (non-strings become "")', async () => {
-  const { router, calls } = setup();
+  const { router, calls, state } = setup();
+  state.pending = { previousId: 'A', startedAt: 1 };
   assert.equal((await router.handle({ type: 'finishAdd', name: 'Carol' }, popup)).ok, true);
   assert.equal((await router.handle({ type: 'saveCurrentAs', name: 'Dave' }, popup)).ok, true);
   await router.handle({ type: 'finishAdd' }, popup);
   assert.deepEqual(calls, [['finishAdd', 'Carol'], ['saveCurrentAs', 'Dave'], ['finishAdd', '']]);
+});
+
+test('finishAdd (sign-out add) has no notice and never returns the account\'s cookies', async () => {
+  const { router, state } = setup();
+  state.pending = { mode: 'signout', previousId: 'A', startedAt: 1 };
+  const res = await router.handle({ type: 'finishAdd', name: 'Carol' }, popup);
+  assert.equal(res.ok, true);
+  assert.equal('notice' in res, false);
+  assert.doesNotMatch(JSON.stringify(res), /secret/);
+});
+
+test('finishAdd (private add) returns a notice naming the new account', async () => {
+  const { router, state } = setup();
+  state.pending = { mode: 'private', previousId: 'A', startedAt: 1, windowId: null, storeId: '1', capturedCookies: [{ name: 'IAM', value: 'secret' }] };
+  const res = await router.handle({ type: 'finishAdd', name: '  Carol ' }, popup);
+  assert.equal(res.ok, true);
+  assert.equal(res.notice, 'Saved “Carol”. Click it to switch.');
+  assert.doesNotMatch(JSON.stringify(res), /secret/);
+});
+
+test('finishAdd errors carry no notice', async () => {
+  const { router } = setup();
+  const res = await router.handle({ type: 'finishAdd', name: 'Carol' }, popup);
+  assert.deepEqual([res.ok, res.error, 'notice' in res], [false, 'No account is being added', false]);
+});
+
+test('openIncognitoSettings opens the extension settings page', async () => {
+  const { router, calls } = setup();
+  const res = await router.handle({ type: 'openIncognitoSettings' }, popup);
+  assert.equal(res.ok, true);
+  assert.deepEqual(calls, [['openSettings']]);
+  const s2 = setup({ privateWindows: false });
+  assert.equal((await s2.router.handle({ type: 'openIncognitoSettings' }, popup)).ok, false);
 });
 
 test('rename goes to the store and refreshes the badge', async () => {
@@ -323,3 +422,84 @@ test('a failing sync is logged, not thrown', async () => {
   s.onCookieChanged(change('.zoho.com'));
   await timers.advance(1500);
 });
+
+// ---------------------------------------------------------------------------
+// Cookie changes by store: regular → sync, the private add's store → capture
+// ---------------------------------------------------------------------------
+
+test('private capture debounce is 500 ms', () => {
+  assert.equal(CAPTURE_DEBOUNCE_MS, 500);
+});
+
+test('the scheduler can run another switcher op (capturePrivate) on its own debounce', async () => {
+  const timers = fakeTimers();
+  const runs = [];
+  const switcher = { isLocked: () => false, async syncActive() { runs.push('sync'); }, async capturePrivate() { runs.push(['capture', timers.now()]); } };
+  const s = createCookieSyncScheduler({
+    switcher, run: () => switcher.capturePrivate(), delay: CAPTURE_DEBOUNCE_MS, setTimer: timers.set, clearTimer: timers.clear, now: timers.now,
+  });
+  s.onCookieChanged(change('.zoho.com'));
+  await timers.advance(300);
+  s.onCookieChanged(change('accounts.zoho.com'));
+  await timers.advance(499);
+  assert.deepEqual(runs, []);
+  await timers.advance(1);
+  assert.deepEqual(runs, [['capture', 800]]);
+});
+
+function changeRouter(pending) {
+  const got = { sync: [], capture: [] };
+  let current = pending;
+  const r = createCookieChangeRouter({
+    sync: { onCookieChanged: (c) => got.sync.push(c.cookie.storeId) },
+    capture: { onCookieChanged: (c) => got.capture.push(c.cookie.storeId) },
+    getPending: async () => {
+      if (current instanceof Error) throw current;
+      return current;
+    },
+  });
+  return { r, got, setPending: (p) => { current = p; } };
+}
+
+const storeChange = (storeId, domain = '.zoho.com') => ({ removed: false, cause: 'explicit', cookie: { name: 'x', domain, storeId } });
+const PRIVATE_PENDING = { mode: 'private', previousId: 'A', startedAt: 1, windowId: 50, storeId: '1' };
+
+test('regular-store Zoho changes go to the sync scheduler only (without reading pending)', async () => {
+  const { r, got } = changeRouter(new Error('must not be read'));
+  await r.onCookieChanged(storeChange('0'));
+  assert.deepEqual(got, { sync: ['0'], capture: [] });
+});
+
+test('Incognito-store changes never reach the sync scheduler', async () => {
+  for (const pending of [null, PRIVATE_PENDING, { mode: 'signout', previousId: 'A', startedAt: 1 }, { previousId: null, startedAt: 1 }]) {
+    const { r, got } = changeRouter(pending);
+    await r.onCookieChanged(storeChange('1'));
+    await r.onCookieChanged(storeChange('1', 'accounts.zoho.eu'));
+    assert.deepEqual(got.sync, [], JSON.stringify(pending));
+  }
+});
+
+test('the private add\'s store goes to the capture scheduler', async () => {
+  const { r, got } = changeRouter(PRIVATE_PENDING);
+  await r.onCookieChanged(storeChange('1'));
+  assert.deepEqual(got, { sync: [], capture: ['1'] });
+});
+
+test('other stores, no private add, sign-out adds, non-Zoho cookies and storeless changes are ignored', async () => {
+  const cases = [
+    [PRIVATE_PENDING, storeChange('2')],
+    [null, storeChange('1')],
+    [{ mode: 'signout', previousId: 'A', startedAt: 1 }, storeChange('1')],
+    [{ ...PRIVATE_PENDING, storeId: '1' }, storeChange('1', '.google.com')],
+    [PRIVATE_PENDING, storeChange('0', 'notzoho.com')],
+    [PRIVATE_PENDING, storeChange(undefined)],
+    [PRIVATE_PENDING, {}],
+    [new Error('storage gone'), storeChange('1')],
+  ];
+  for (const [pending, c] of cases) {
+    const { r, got } = changeRouter(pending);
+    await r.onCookieChanged(c);
+    assert.deepEqual(got, { sync: [], capture: [] }, JSON.stringify([pending?.message ?? pending, c]));
+  }
+});
+

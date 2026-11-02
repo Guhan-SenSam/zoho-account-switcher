@@ -77,6 +77,26 @@ test('listZohoTabs queries tabs by the Zoho host patterns', async () => {
   assert.deepEqual(result.map((t) => t.id), [1, 2, 3]);
 });
 
+test('listZohoTabs never returns Incognito tabs (the extension spans both profiles)', async () => {
+  const f = fakes({ tabs: [...zohoTabs, { id: 7, url: 'https://accounts.zoho.com/signin', incognito: true }] });
+  const result = await createSiteData(f).listZohoTabs();
+  assert.deepEqual(result.map((t) => t.id), [1, 2, 3]);
+});
+
+test('resetTabs never injects into or reloads an Incognito tab', async () => {
+  const f = fakes({ tabs: [zohoTabs[0], { id: 7, url: 'https://mail.zoho.com/', incognito: true }] });
+  assert.equal(await createSiteData(f).resetTabs(), 1);
+  const touched = f.log.filter(([n]) => n === 'scripting.executeScript' || n === 'tabs.reload').map(([, id]) => id);
+  assert.deepEqual(touched, [1, 1]);
+});
+
+test('deepClean does not add origins of Incognito tabs', async () => {
+  const f = fakes({ tabs: [{ id: 7, url: 'https://private-tenant.zoho.eu/app', incognito: true }] });
+  await createSiteData(f).deepClean();
+  const { origins } = f.log.find(([n]) => n === 'browsingData.remove')[1];
+  assert.equal(origins.includes('https://private-tenant.zoho.eu'), false);
+});
+
 test('resetTabs clears sessionStorage in each tab, then reloads it', async () => {
   const f = fakes({ tabs: zohoTabs });
   const count = await createSiteData(f).resetTabs();

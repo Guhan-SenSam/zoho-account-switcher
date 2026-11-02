@@ -1,5 +1,6 @@
 // Dev-only: drives the real popup against stub.js and checks the data-testid
 // contract and the main flows. Injected by serve.mjs when ?selftest is present.
+// Runs the suite named after the page's ?scenario= (see SUITES at the bottom).
 // Results are written to <pre id="selftest"> (read with `--dump-dom`) and to
 // the console. Run it via: node test/popup-harness/selftest.mjs
 (() => {
@@ -39,7 +40,79 @@
     }
   }
 
-  window.addEventListener('load', async () => {
+  const text = (el) => (el?.textContent ?? '').replace(/\s+/g, ' ').trim();
+  const addLabel = () => text(tid('add-account').querySelector('.btn-label'));
+  const PRIVATE_INTRO = 'Sign in to the new Zoho account in the private window. You stay signed in here.';
+  const SIGNOUT_INTRO = 'Sign in to Zoho in the tab that just opened, then name this account.';
+  const INCOGNITO_HINT = 'Turn on Allow in Incognito to add accounts without signing out.';
+  /** Checks the message area shows `want` (string or RegExp) styled as `kind`. */
+  const checkMessage = (kind, want) => {
+    const msg = tid('message');
+    check(visible(msg), `message visible (${kind})`);
+    const got = text(msg);
+    check(want instanceof RegExp ? want.test(got) : got === want, `message text "${got}"`);
+    const box = $('#message-box');
+    check(box.classList.contains(`message-${kind}`), `#message-box has message-${kind}, got "${box.className}"`);
+    for (const other of ['error', 'warning', 'info'].filter((k) => k !== kind)) {
+      check(!box.classList.contains(`message-${other}`), `#message-box must not have message-${other}`);
+    }
+    check(msg.dataset.kind === kind, `data-kind=${kind}, got ${msg.dataset.kind}`);
+    check(msg.getAttribute('role') === (kind === 'error' ? 'alert' : 'status'), `role for ${kind}`);
+  };
+  /** The private-mode pending panel, common to every private scenario. */
+  const checkPrivatePanel = ({ windowOpen, captured }) => {
+    const panel = tid('pending-panel');
+    check(panel, 'pending-panel');
+    check(panel.dataset.mode === 'private', `data-mode=private, got ${panel.dataset.mode}`);
+    check(tid('new-account-name') && tid('finish-add') && tid('cancel-add'), 'name input, Save and Cancel');
+    check(text(panel.querySelector('.panel-title')) === 'Adding an account', 'heading');
+    check(text(panel.querySelector('.panel-text')) === PRIVATE_INTRO, `intro, got "${text(panel.querySelector('.panel-text'))}"`);
+    check(!/tab that just opened/.test(text(panel)), 'no sign-out copy');
+    check(!/signs you back in/.test(text(panel)), 'no "signs you back in" in private mode');
+    check(!$('[data-testid="account"]'), 'list hidden while pending');
+    check(!visible(tid('incognito-hint')), 'no incognito hint while pending');
+    const closed = tid('private-window-closed');
+    const note = text(panel.querySelector('.panel-note'));
+    if (windowOpen) {
+      check(!closed, 'no "window closed" notice while the window is open');
+      check(addLabel() === 'Show private window', `add-account label, got "${addLabel()}"`);
+      check(note === 'Cancel closes the private window.', `cancel note, got "${note}"`);
+    } else {
+      check(visible(closed), 'private-window-closed shown');
+      const want = `The private window was closed. ${captured
+        ? 'Your sign-in was saved — name it and click Save.'
+        : 'Reopen it to sign in.'}`;
+      check(text(closed) === want, `closed notice, got "${text(closed)}"`);
+      check(addLabel() === 'Reopen private window', `add-account label, got "${addLabel()}"`);
+      check(!/closes the private window/.test(note), `cancel note must not claim to close a closed window, got "${note}"`);
+    }
+    // Closed with nothing captured: reopening is the primary action, not Save.
+    const reopenFirst = !windowOpen && !captured;
+    check(tid('add-account').classList.contains('btn-primary') === reopenFirst, `add-account primary=${reopenFirst}`);
+    check(tid('finish-add').classList.contains('btn-primary') === !reopenFirst, `finish-add primary=${!reopenFirst}`);
+  };
+  /**
+   * Types a name, clicks Save, and expects the private-mode result: a new
+   * inactive row, `active` still active, and the notice.
+   */
+  async function savePrivate(name, active) {
+    const before = sent().length;
+    type(tid('new-account-name'), name);
+    tid('finish-add').click();
+    const s = sent().slice(before);
+    check(s.length === 1 && s[0].type === 'finishAdd' && s[0].name === name, `sent finishAdd, got ${sentSince(before)}`);
+    await idle();
+    check(!tid('pending-panel'), 'pending view gone');
+    const row = $$('li[data-testid="account"]').find((li) => text(li.querySelector('.name')) === name);
+    check(row, `new row "${name}" listed`);
+    check(row.dataset.active === 'false', 'new account is not made active');
+    check(activeId() === active, `active stays ${active}, got ${activeId()}`);
+    checkMessage('info', `Saved “${name}”. Click it to switch.`);
+    check(document.activeElement === row.querySelector('[data-testid="switch"]'), 'focus on the new row');
+    return row;
+  }
+
+  async function listSuite() {
     await step('initial load renders list and clears busy', async () => {
       await idle();
       const rows = $$('li[data-testid="account"]');
@@ -56,6 +129,8 @@
       check(!visible(tid('message')), 'message hidden when empty');
       check(!tid('save-current-panel'), 'no save-current panel when an account is active');
       check(!tid('pending-panel'), 'no pending panel');
+      check(tid('incognito-hint') && !visible(tid('incognito-hint')), 'incognito hint hidden when incognitoAllowed is undefined');
+      check(!visible(tid('incognito-settings')), 'incognito-settings hidden');
     });
 
     await step('switch marks busy, disables controls, then moves Active', async () => {
@@ -262,8 +337,15 @@
 
     await step('add account → pending view → validation → finish', async () => {
       tid('add-account').click();
+      check(text($('#status')) === 'Opening sign-in…', `busy label, got "${text($('#status'))}"`);
       await idle();
       check(tid('pending-panel') && tid('new-account-name') && tid('finish-add') && tid('cancel-add'), 'pending view');
+      check(tid('pending-panel').dataset.mode === 'signout', 'data-mode=signout');
+      check(text($('.panel-text')) === SIGNOUT_INTRO, 'sign-out intro unchanged');
+      check(/^Cancel signs you back in as .+\.$/.test(text($('.panel-note'))), `cancel note, got "${text($('.panel-note'))}"`);
+      check(addLabel() === 'Reopen sign-in page', `add-account label, got "${addLabel()}"`);
+      check(!tid('private-window-closed'), 'no private-window notice');
+      check(tid('finish-add').classList.contains('btn-primary'), 'Save is primary');
       check(!$('[data-testid="account"]'), 'list hidden while pending');
       check(document.activeElement === tid('new-account-name'), 'name input focused');
       check(tid('new-account-name').maxLength === 80, `new-account-name maxlength should be 80, got ${tid('new-account-name').maxLength}`);
@@ -296,6 +378,215 @@
       await idle();
       check(tid('deep-clean').checked === true, 'on after response');
     });
+
+    await step('a notice next to warnings shows first, styled as a warning', async () => {
+      // The stub never returns both; simulate a background that does.
+      const real = window.chrome.runtime.sendMessage;
+      window.chrome.runtime.sendMessage = async (msg) => ({ ...(await real(msg)), notice: 'Saved.', warnings: ['1 tab could not be reloaded.'] });
+      try {
+        $('[data-testid="account"][data-active="false"] [data-testid="switch"]').click();
+        await idle();
+      } finally {
+        window.chrome.runtime.sendMessage = real;
+      }
+      checkMessage('warning', 'Saved.1 tab could not be reloaded.'); // one span per line
+      const lines = $$('#message .message-line').map(text);
+      check(lines.join('|') === 'Saved.|1 tab could not be reloaded.', `lines, got ${JSON.stringify(lines)}`);
+    });
+  }
+
+  /** Old background data: a pending add without `mode` is the sign-out flow. */
+  async function pendingSuite() {
+    await step('pending without mode renders the sign-out view', async () => {
+      await idle();
+      const panel = tid('pending-panel');
+      check(panel?.dataset.mode === 'signout', `data-mode=signout, got ${panel?.dataset.mode}`);
+      check(text(panel.querySelector('.panel-text')) === SIGNOUT_INTRO, 'sign-out intro');
+      check(text(panel.querySelector('.panel-note')) === 'Cancel signs you back in as TurfScout Ops.', 'cancel note');
+      check(addLabel() === 'Reopen sign-in page', `add-account label, got "${addLabel()}"`);
+      check(!tid('private-window-closed'), 'no private-window notice');
+      check(document.activeElement === tid('new-account-name'), 'name input focused');
+    });
+  }
+
+  async function privatePendingSuite() {
+    await step('private pending (window open): copy, testids, footer label', async () => {
+      await idle();
+      checkPrivatePanel({ windowOpen: true, captured: true });
+      check(document.activeElement === tid('new-account-name'), 'name input focused');
+    });
+
+    await step('"Show private window" sends beginAdd and keeps the typed name', async () => {
+      type(tid('new-account-name'), 'Half typed');
+      const before = sent().length;
+      tid('add-account').click();
+      check(text($('#status')) === 'Showing window…', `busy label, got "${text($('#status'))}"`);
+      const s = sent().slice(before);
+      check(s.length === 1 && s[0].type === 'beginAdd' && Object.keys(s[0]).length === 1, `sent beginAdd, got ${sentSince(before)}`);
+      await idle();
+      checkPrivatePanel({ windowOpen: true, captured: true });
+      check(tid('new-account-name').value === 'Half typed', 'typed name kept');
+    });
+
+    await step('empty name is rejected without a request', async () => {
+      type(tid('new-account-name'), '  ');
+      const before = sent().length;
+      tid('finish-add').click();
+      check(sent().length === before, `nothing sent, got ${sentSince(before)}`);
+      checkMessage('error', 'Name must be 1–40 characters');
+    });
+
+    await step('Save adds the account without switching and shows the notice', async () => {
+      await savePrivate('Client X', 'a1');
+    });
+
+    await step('the notice can be dismissed', async () => {
+      $('#message-dismiss').click();
+      check(!visible(tid('message')), 'dismissed');
+      check(!$('#message-box').classList.contains('message-info'), 'style cleared');
+    });
+
+    await step('Add account opens a private window (no sign-out)', async () => {
+      const before = sent().length;
+      tid('add-account').click();
+      check(text($('#status')) === 'Opening private window…', `busy label, got "${text($('#status'))}"`);
+      check(sent().slice(before).map((m) => m.type).join() === 'beginAdd', `sent beginAdd, got ${sentSince(before)}`);
+      await idle();
+      checkPrivatePanel({ windowOpen: true, captured: false });
+      check(tid('new-account-name').value === '', 'name input empty for a new add');
+    });
+
+    await step('Cancel ends the private add and keeps the active account', async () => {
+      const before = sent().length;
+      tid('cancel-add').click();
+      check(sent().slice(before).map((m) => m.type).join() === 'cancelAdd', `sent cancelAdd, got ${sentSince(before)}`);
+      await idle();
+      check(!tid('pending-panel'), 'not pending');
+      check(activeId() === 'a1', `active still a1, got ${activeId()}`);
+      check(!visible(tid('message')), 'no message');
+      check(addLabel() === 'Add account', `add-account label, got "${addLabel()}"`);
+      check(!visible(tid('incognito-hint')), 'no incognito hint when allowed');
+    });
+
+    await step('window closed while the popup is open: refresh shows it', async () => {
+      tid('add-account').click();
+      await idle();
+      window.__stub.db.pending.windowOpen = false; // background: windows.onRemoved
+      window.__stub.db.pending.captured = true;
+      document.dispatchEvent(new Event('visibilitychange'));
+      await until(() => tid('private-window-closed'), 'closed notice after refresh');
+      await idle();
+      checkPrivatePanel({ windowOpen: false, captured: true });
+      tid('cancel-add').click();
+      await idle();
+    });
+  }
+
+  async function privateClosedCapturedSuite() {
+    await step('private pending (closed, captured): copy, testids, footer label', async () => {
+      await idle();
+      checkPrivatePanel({ windowOpen: false, captured: true });
+      check(tid('private-window-closed').classList.contains('callout-ok'), 'reassuring (ok) style');
+      check(text($('.panel-note')) === 'Cancel discards this sign-in.', `cancel note, got "${text($('.panel-note'))}"`);
+    });
+
+    await step('Save still works from the captured sign-in', async () => {
+      await savePrivate('Vault admin', 'a1');
+    });
+  }
+
+  async function privateClosedSuite() {
+    await step('private pending (closed, not captured): copy, testids, footer label', async () => {
+      await idle();
+      checkPrivatePanel({ windowOpen: false, captured: false });
+      check(tid('private-window-closed').classList.contains('callout-warn'), 'warning style');
+      check(text($('.panel-note')) === 'Cancel stops adding this account.', `cancel note, got "${text($('.panel-note'))}"`);
+    });
+
+    await step('Save without a sign-in shows the background error, stays pending', async () => {
+      type(tid('new-account-name'), 'Too soon');
+      tid('finish-add').click();
+      await idle();
+      checkMessage('error', 'Sign in to Zoho in the private window first');
+      check(tid('pending-panel'), 'still pending');
+      check(tid('new-account-name').value === 'Too soon', 'typed name kept');
+    });
+
+    await step('"Reopen private window" sends beginAdd and the panel updates', async () => {
+      const before = sent().length;
+      tid('add-account').click();
+      check(text($('#status')) === 'Opening private window…', `busy label, got "${text($('#status'))}"`);
+      check(sent().slice(before).map((m) => m.type).join() === 'beginAdd', `sent beginAdd, got ${sentSince(before)}`);
+      await idle();
+      checkPrivatePanel({ windowOpen: true, captured: false });
+      check(!visible(tid('message')), 'error cleared');
+      check(tid('new-account-name').value === 'Too soon', 'typed name kept');
+      check(document.activeElement === tid('new-account-name'), 'name input focused');
+    });
+  }
+
+  async function incognitoOffSuite() {
+    await step('incognito not allowed: hint and settings button under Add account', async () => {
+      await idle();
+      const hint = tid('incognito-hint');
+      check(visible(hint), 'incognito-hint visible');
+      const button = tid('incognito-settings');
+      check(button instanceof HTMLButtonElement && visible(button), 'incognito-settings is a visible button');
+      check(text(button) === 'Open settings', `button text, got "${text(button)}"`);
+      check(text(hint) === `${INCOGNITO_HINT} Open settings`, `hint text, got "${text(hint)}"`);
+      check(tid('add-account').compareDocumentPosition(hint) & Node.DOCUMENT_POSITION_FOLLOWING, 'hint follows Add account');
+      check(hint.compareDocumentPosition(tid('deep-clean')) & Node.DOCUMENT_POSITION_FOLLOWING, 'hint precedes deep clean');
+      check(text($(`#${tid('add-account').getAttribute('aria-describedby')}`)) === INCOGNITO_HINT, 'add-account described by the hint');
+      check(hint.getBoundingClientRect().right <= document.documentElement.clientWidth, 'fits in 320px');
+    });
+
+    await step('Open settings sends openIncognitoSettings', async () => {
+      const before = sent().length;
+      tid('incognito-settings').click();
+      check(document.body.dataset.busy === 'true', 'busy');
+      check(tid('incognito-settings').disabled, 'disabled while busy');
+      check(text($('#status')) === 'Opening settings…', `busy label, got "${text($('#status'))}"`);
+      const s = sent().slice(before);
+      check(s.length === 1 && JSON.stringify(s[0]) === '{"type":"openIncognitoSettings"}', `sent exactly {type:'openIncognitoSettings'}, got ${sentSince(before)}`);
+      await idle();
+      check(!tid('incognito-settings').disabled, 're-enabled');
+      check(!visible(tid('message')), 'no message');
+    });
+
+    await step('Add account still uses the sign-out flow; hint hidden while pending', async () => {
+      tid('add-account').click();
+      await idle();
+      check(tid('pending-panel')?.dataset.mode === 'signout', 'sign-out pending');
+      check(text($('.panel-text')) === SIGNOUT_INTRO, 'sign-out intro');
+      check(!visible(tid('incognito-hint')), 'hint hidden while pending');
+      tid('cancel-add').click();
+      await idle();
+      check(visible(tid('incognito-hint')), 'hint back after cancel');
+      check(activeId() === 'a1', 'previous account restored');
+    });
+
+    await step('hint disappears once Incognito is allowed', async () => {
+      window.__stub.db.incognitoAllowed = true;
+      document.dispatchEvent(new Event('visibilitychange'));
+      await until(() => !visible(tid('incognito-hint')), 'hint hidden after refresh');
+      check(!tid('add-account').hasAttribute('aria-describedby'), 'aria-describedby removed');
+    });
+  }
+
+  const SUITES = {
+    list: listSuite,
+    pending: pendingSuite,
+    'private-pending': privatePendingSuite,
+    'private-closed-captured': privateClosedCapturedSuite,
+    'private-closed': privateClosedSuite,
+    'incognito-off': incognitoOffSuite,
+  };
+
+  window.addEventListener('load', async () => {
+    const scenario = new URLSearchParams(location.search).get('scenario') || 'list';
+    const suite = SUITES[scenario];
+    if (suite) await suite();
+    else results.push(`FAIL no self-test suite for scenario "${scenario}"`);
 
     document.body.append(Object.assign(document.createElement('pre'), {
       id: 'selftest',

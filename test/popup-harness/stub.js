@@ -5,8 +5,16 @@
 // Query params:
 //   scenario=<name>          initial state (see SCENARIOS below)
 //   delay=<ms>               simulated background latency (default 500)
+//   fill=<testid>=<text>     type into an input after the first render (repeatable;
+//                            runs before `click`), e.g. fill=new-account-name=Work
 //   click=<testid>@<id>,...  clicks to perform after the first render, in order
 //                            (e.g. click=menu@a2,rename@a2); `@id` is optional
+//
+// A scenario whose state has `incognitoAllowed: true` makes beginAdd / finishAdd /
+// cancelAdd behave like the background's private-window mode (the current account
+// stays active; finishAdd returns a `notice`). Otherwise they use the sign-out
+// flow. In private mode finishAdd succeeds while the private window is open (the
+// stub assumes you signed in there) or once a sign-in was captured.
 //
 // Every request is also recorded in `window.__stub.sent` (at call time) so the
 // self-test can assert exactly what the popup sent.
@@ -46,8 +54,21 @@
     ...over,
   });
 
+  /** state.pending for a private-window add, as the background sends it. */
+  const privatePending = (over) => ({
+    mode: 'private', previousId: 'a1', startedAt: now - 40e3, windowOpen: true, captured: false, ...over,
+  });
+
   const SCENARIOS = {
     list: { state: base() },
+    'incognito-off': { state: base({ incognitoAllowed: false }) },
+    'private-pending': { state: base({ incognitoAllowed: true, pending: privatePending({ captured: true }) }) },
+    'private-closed-captured': {
+      state: base({ incognitoAllowed: true, pending: privatePending({ windowOpen: false, captured: true }) }),
+    },
+    'private-closed': {
+      state: base({ incognitoAllowed: true, pending: privatePending({ windowOpen: false, captured: false }) }),
+    },
     'deep-clean-on': { state: base({ settings: { deepClean: true } }) },
     many: { state: base({ accounts: MANY, activeId: 'a5' }) },
     pending: { state: base({ activeId: null, pending: { previousId: 'a1', startedAt: now - 30e3 } }) },
@@ -92,14 +113,15 @@
   const need = (cond, msg) => { if (!cond) throw new Error(msg); };
   const findAcct = (id) => db.accounts.find((a) => a.id === id);
   let nextId = 100;
-  const createActive = (name) => {
+  const createAccount = (name, { activate = true } = {}) => {
     const id = `n${nextId++}`;
     db.accounts = [...db.accounts, {
       id, name, initials: initials(name), color: COLORS[db.accounts.length % COLORS.length],
       cookieCount: 18, createdAt: Date.now(), savedAt: Date.now(),
     }];
-    db.activeId = id;
+    if (activate) db.activeId = id;
   };
+  const isPrivate = (pending) => pending?.mode === 'private';
 
   const handlers = {
     getState: () => ({}),
@@ -111,25 +133,49 @@
       return { warnings: [] };
     },
     beginAdd: () => {
-      if (!db.pending) db.pending = { previousId: db.activeId, startedAt: Date.now() };
+      if (isPrivate(db.pending)) {
+        // Window open: just focused. Closed: a new window with a fresh sign-in.
+        if (!db.pending.windowOpen) db.pending = { ...db.pending, windowOpen: true, captured: false };
+        return { warnings: [], mode: 'private' };
+      }
+      if (!db.pending && db.incognitoAllowed === true) {
+        db.pending = {
+          mode: 'private', previousId: db.activeId, startedAt: Date.now(), windowOpen: true, captured: false,
+        };
+        return { warnings: [], mode: 'private' };
+      }
+      if (!db.pending) {
+        db.pending = {
+          mode: 'signout', previousId: db.activeId, startedAt: Date.now(), windowOpen: false, captured: false,
+        };
+      }
       db.activeId = null;
-      return { warnings: [] };
+      return { warnings: [], mode: 'signout' };
     },
     finishAdd: ({ name }) => {
       need(db.pending, 'No account is being added');
-      createActive(checkName(name));
+      const valid = checkName(name);
+      if (isPrivate(db.pending)) {
+        need(db.pending.windowOpen || db.pending.captured, 'Sign in to Zoho in the private window first');
+        createAccount(valid, { activate: false });
+        db.pending = null;
+        return { notice: `Saved “${valid}”. Click it to switch.` };
+      }
+      createAccount(valid);
       db.pending = null;
       return {};
     },
     cancelAdd: () => {
       need(db.pending, 'No account is being added');
-      db.activeId = findAcct(db.pending.previousId) ? db.pending.previousId : null;
+      if (!isPrivate(db.pending)) {
+        db.activeId = findAcct(db.pending.previousId) ? db.pending.previousId : null;
+      }
       db.pending = null;
       return { warnings: [] };
     },
     saveCurrentAs: ({ name }) => {
       need(!db.pending && db.activeId === null, 'An account is already active');
-      createActive(checkName(name));
+      createAccount(checkName(name));
       return {};
     },
     rename: ({ id, name }) => {
@@ -148,10 +194,13 @@
       db.settings = { ...db.settings, ...patch };
       return {};
     },
+    // The real background opens chrome://extensions/?id=… in a new tab.
+    openIncognitoSettings: () => ({}),
   };
 
   const sent = [];
-  window.__stub = { sent };
+  /** `db` is the fake background's state; the self-test edits it to simulate events. */
+  window.__stub = { sent, db };
 
   let firstGetState = true;
   async function sendMessage(msg) {
@@ -180,12 +229,21 @@
     writable: true,
   });
 
-  // Scripted clicks for screenshots of row menus / rename / confirm states.
+  // Scripted typing and clicks for screenshots of row menus / rename / confirm states.
+  const fills = params.getAll('fill').filter(Boolean);
   const clicks = (params.get('click') || '').split(',').filter(Boolean);
-  if (clicks.length) {
+  if (fills.length || clicks.length) {
     window.addEventListener('load', async () => {
       const wait = (ms) => new Promise((r) => setTimeout(r, ms));
       await wait(400);
+      for (const fill of fills) {
+        const at = fill.indexOf('=');
+        const testid = at < 0 ? fill : fill.slice(0, at);
+        const el = document.querySelector(`[data-testid="${testid}"]`);
+        if (!el) { console.warn('[stub] missing', testid); continue; }
+        el.value = at < 0 ? '' : fill.slice(at + 1);
+        el.dispatchEvent(new Event('input', { bubbles: true }));
+      }
       for (const step of clicks) {
         const [testid, id] = step.split('@');
         const scope = id ? `[data-id="${id}"] ` : '';
